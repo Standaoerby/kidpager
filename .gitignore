@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+venv/
+env/
+.venv/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime / local
+*.log
+.kidpager/
+config.local.json
+history.json
+
+# SSH / deployment artefacts
+id_kidpager
+id_kidpager.pub
+*.pem
+
+# Local build / testing
+build/
+dist/
+*.zip
