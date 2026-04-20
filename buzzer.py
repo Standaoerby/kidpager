@@ -1,10 +1,14 @@
 """Passive buzzer via hardware PWM on GPIO 13 (pigpio).
 
-Uses pigpiod daemon for true hardware PWM — does not generate software
-interrupts, so it does not disturb SPI timing for the e-ink display.
+Uses the pigpiod daemon for true hardware PWM — it does not generate
+software interrupts, so it does not disturb SPI timing for the e-ink
+display during partial refresh.
 
-Requires: sudo apt install pigpio python3-pigpio
-         sudo systemctl enable pigpiod --now
+Setup is handled automatically by deploy.ps1 step [2/7]. On Raspberry Pi
+OS Bookworm the pigpio apt package is no longer available (it does not
+support the RP1 chip on Pi 5), so deploy.ps1 builds joan2937/pigpio from
+source, installs the Python module via pip, drops in a systemd unit, and
+refreshes the dynamic linker cache. See deploy.ps1 for the full recipe.
 """
 import asyncio, time
 

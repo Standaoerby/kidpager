@@ -110,7 +110,9 @@ async def main():
     config.save()
     ui.flush_history()  # persist any pending changes on shutdown
     if lora_ok: lora.cleanup()
-    if ui.eink: ui.eink.cleanup()
+    if ui.eink:
+        ui.eink.cleanup()   # stop worker thread
+        ui.eink.sleep()     # deep-sleep display so BUSY drops LOW for next start
     buzzer.cleanup()
     kb.close()
 
