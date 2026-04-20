@@ -31,7 +31,7 @@ Compared to the earlier ESP32 / Heltec Wireless Paper prototypes:
 ## Known limitations
 
 - Battery life ~6 h with a 2000 mAh LiPo. A 4000 mAh cell would comfortably hit the 12 h target.
-- No WiFi transport yet — the `channel` field in the profile menu is reserved for future use.
+- No WiFi transport. The `channel` field in the profile menu provides lightweight LoRa group isolation — the receiver drops packets whose channel byte does not match.
 - No encryption. This was a deliberate simplification for v0.9.
 - No OTA update mechanism — updates go through `deploy.ps1` over SSH.
 

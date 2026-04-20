@@ -1,5 +1,12 @@
-"""E-Ink display driver for Waveshare 2.13 V4 HAT."""
-import sys, time
+"""E-Ink display driver for Waveshare 2.13 V4 HAT.
+
+Rendering runs in a background worker thread so the main asyncio loop
+never blocks on a partial/full refresh (~300 ms partial, ~2 s full).
+The worker uses a single-slot "latest image wins" queue: if a new image
+is submitted while the worker is still drawing, the pending image is
+replaced — we never render a stale frame and the caller never waits.
+"""
+import sys, time, threading
 import RPi.GPIO as GPIO
 sys.path.insert(0, "/home/pi")
 from PIL import Image, ImageDraw, ImageFont
@@ -30,7 +37,6 @@ def _hw_reset():
     time.sleep(0.5)
     GPIO.output(EINK_RST, GPIO.HIGH)
     time.sleep(0.5)
-    # Wait for BUSY to go low (max 3 sec)
     for _ in range(300):
         if GPIO.input(EINK_BUSY) == 0:
             return True
@@ -39,7 +45,6 @@ def _hw_reset():
     return False
 
 
-# Do hardware reset before importing driver
 _hw_reset()
 from waveshare_epd import epd2in13_V4 as epd_driver
 
@@ -51,7 +56,15 @@ class EInkDisplay:
         self.epd.Clear(0xFF)
         self.first_draw = True
         self.updates = 0
-        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4")
+        # Worker state
+        self._pending = None              # latest image awaiting render; "latest wins"
+        self._lock = threading.Lock()     # protects _pending
+        self._hw_lock = threading.Lock()  # serialises actual SPI/hardware access
+        self._wake = threading.Event()
+        self._stop = False
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="eink-worker")
+        self._thread.start()
+        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker)")
 
     def draw_chat(self, name, channel, messages, input_text, lora_on=False):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
@@ -75,7 +88,7 @@ class EInkDisplay:
         if len(inp) > 32:
             inp = inp[-32:]
         d.text((3, 107), inp, font=FONT, fill=0)
-        self._update(img)
+        self._submit(img)
 
     def draw_profile(self, name, channel, selection):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
@@ -91,7 +104,7 @@ class EInkDisplay:
             else:
                 d.text((10, y), item, font=FONT, fill=0)
             y += 24
-        self._update(img)
+        self._submit(img)
 
     def draw_name_edit(self, name):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
@@ -101,9 +114,31 @@ class EInkDisplay:
         d.text((10, 42), "Name:", font=FONT, fill=0)
         d.rectangle([10, 60, WIDTH - 10, 78], outline=0)
         d.text((14, 62), name, font=FONT, fill=0)
-        self._update(img)
+        self._submit(img)
 
-    def _update(self, img):
+    def _submit(self, img):
+        """Hand the image to the worker. Latest-wins: replaces any queued frame."""
+        with self._lock:
+            self._pending = img
+        self._wake.set()
+
+    def _worker(self):
+        while not self._stop:
+            self._wake.wait()
+            self._wake.clear()
+            while not self._stop:
+                with self._lock:
+                    img = self._pending
+                    self._pending = None
+                if img is None:
+                    break
+                try:
+                    with self._hw_lock:
+                        self._render(img)
+                except Exception as e:
+                    print(f"E-Ink worker error: {e}")
+
+    def _render(self, img):
         buf = self.epd.getbuffer(img)
         if self.first_draw:
             self.epd.display(buf)
@@ -119,9 +154,21 @@ class EInkDisplay:
                 self.epd.displayPartial(buf)
 
     def clear(self):
-        self.epd.init()
-        self.epd.Clear(0xFF)
-        self.first_draw = True
+        """Drop any pending frame and fully clear the screen."""
+        with self._lock:
+            self._pending = None
+        with self._hw_lock:
+            self.epd.init()
+            self.epd.Clear(0xFF)
+            self.first_draw = True
+
+    def cleanup(self):
+        """Stop the worker cleanly (called on shutdown)."""
+        self._stop = True
+        self._wake.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=3)
 
     def sleep(self):
-        self.epd.sleep()
+        with self._hw_lock:
+            self.epd.sleep()

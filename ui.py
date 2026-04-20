@@ -54,6 +54,7 @@ class PagerUI:
         self.state = "chat"; self.scroll = 0
         self.profile_sel = 0
         self.eink = None
+        self._dirty = False  # history needs flushing to disk
         self._load_history()
         if HAS_EINK:
             try:
@@ -69,15 +70,21 @@ class PagerUI:
                 for m in self.messages:
                     if m.status == STATUS_SENDING:
                         m.status = STATUS_FAIL
+                        self._dirty = True  # sender -> failed needs saving
                 print(f"Loaded {len(self.messages)} messages")
         except:
             self.messages = []
 
-    def _save_history(self):
+    def flush_history(self):
+        """Write history to disk only if something changed since last flush.
+        Called periodically from the main loop to avoid SD-card write amplification."""
+        if not self._dirty:
+            return
         try:
             os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
             with open(HISTORY_FILE, "w") as f:
                 json.dump([m.to_dict() for m in self.messages[-MAX_HISTORY:]], f)
+            self._dirty = False
         except Exception as e:
             print(f"History save error: {e}")
 
@@ -123,13 +130,13 @@ class PagerUI:
         self.messages.append(Message(sender, text, outgoing, msg_id))
         if len(self.messages) > MAX_HISTORY:
             self.messages = self.messages[-MAX_HISTORY:]
-        self._save_history()
+        self._dirty = True
         self.scroll = 0
 
     def mark_delivered(self, msg_id):
         for m in reversed(self.messages):
             if m.msg_id == msg_id and m.status == STATUS_SENDING:
-                m.status = STATUS_OK; self._save_history(); return True
+                m.status = STATUS_OK; self._dirty = True; return True
         return False
 
     def check_timeouts(self):
@@ -137,7 +144,7 @@ class PagerUI:
         for m in self.messages:
             if m.status == STATUS_SENDING and (now - m.timestamp) > ACK_TIMEOUT:
                 m.status = STATUS_FAIL; changed = True
-        if changed: self._save_history()
+        if changed: self._dirty = True
         return changed
 
     def full_redraw(self): self._term_redraw(); self.eink_refresh()
@@ -159,12 +166,14 @@ class PagerUI:
         lora = "LoRa:ON" if self.lora else "LoRa:OFF"
         print(f"\033[2J\033[H KidPager [{self.config.name}]  {lora}")
         print("-" * 50)
-        end = len(self.messages) - self.scroll; start = max(0, end - 8)
-        for msg in self.messages[start:end]:
+        end = len(self.messages) - self.scroll
+        start = max(0, end - 8)
+        shown = self.messages[start:end]
+        for msg in shown:
             t = relative_time(msg.timestamp)
             if msg.outgoing: print(f"  [{msg.status}] {msg.sender}: {msg.text}  ({t})")
             else: print(f"  {msg.sender}: {msg.text}  ({t})")
-        for _ in range(8 - len(self.messages[-8:])): print()
+        for _ in range(8 - len(shown)): print()
         print("-" * 50)
         print(f" > {self.input_buf}_")
         print("=" * 50)

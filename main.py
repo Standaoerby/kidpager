@@ -8,6 +8,7 @@ from ui import PagerUI
 from buzzer import Buzzer
 
 CONFIG = os.path.expanduser("~/.kidpager/config.json")
+FLUSH_INTERVAL = 2.0  # seconds between history flushes to SD card
 
 async def main():
     config = Config(CONFIG)
@@ -32,6 +33,7 @@ async def main():
     eink_pending = False
     last_kb_check = time.time()
     last_ack_check = time.time()
+    last_flush = time.time()
 
     try:
         while True:
@@ -89,7 +91,6 @@ async def main():
 
             if now - last_ack_check > 2:
                 last_ack_check = now
-                # Detect newly-timed-out messages to beep once per failure
                 before = sum(1 for m in ui.messages if m.status == "x")
                 if ui.check_timeouts():
                     after = sum(1 for m in ui.messages if m.status == "x")
@@ -97,13 +98,19 @@ async def main():
                         asyncio.create_task(buzzer.beep_error())
                     ui.full_redraw()
 
+            if now - last_flush > FLUSH_INTERVAL:
+                last_flush = now
+                ui.flush_history()
+
             await asyncio.sleep(0.01)
 
     except KeyboardInterrupt:
         pass
 
     config.save()
+    ui.flush_history()  # persist any pending changes on shutdown
     if lora_ok: lora.cleanup()
+    if ui.eink: ui.eink.cleanup()
     buzzer.cleanup()
     kb.close()
 

@@ -15,12 +15,38 @@ KEY_LSHIFT=42;KEY_RSHIFT=54;KEY_LCTRL=29;KEY_RCTRL=97
 KEY_UP=103;KEY_DOWN=108;KEY_LEFT=105;KEY_RIGHT=106
 KEY_LALT=56;KEY_RALT=100
 SKIP_NAMES={"vc4-hdmi","vc4-hdmi HDMI Jack","fe205000.gpio"}
+KB_NAME_HINTS=("M4","KEYBOARD","KB","BT-KEY","HID")
+
+
+def _paired_keyboards():
+    """Return MAC addresses of known BT devices whose names look like keyboards.
+    No hardcoded addresses — enumerates whatever bluetoothctl already knows about."""
+    try:
+        r=subprocess.run(["bluetoothctl","devices"],
+                         capture_output=True,text=True,timeout=5)
+        macs=[]
+        for line in r.stdout.splitlines():
+            parts=line.split(None,2)
+            if len(parts)>=2 and parts[0]=="Device":
+                mac=parts[1]
+                name=parts[2] if len(parts)>2 else ""
+                up=name.upper()
+                if any(k in up for k in KB_NAME_HINTS):
+                    macs.append(mac)
+        return macs
+    except Exception:
+        return []
+
 
 def _bt_try():
-    try:
-        subprocess.run(["bluetoothctl","connect","45:40:86:00:03:21"],capture_output=True,timeout=5)
-    except Exception:
-        pass
+    """Attempt to connect each known keyboard-like device. First success wins."""
+    for mac in _paired_keyboards():
+        try:
+            subprocess.run(["bluetoothctl","connect",mac],
+                           capture_output=True,timeout=5)
+        except Exception:
+            pass
+
 
 class KeyboardReader:
     def __init__(self):
@@ -38,7 +64,7 @@ class KeyboardReader:
                     if name in SKIP_NAMES:
                         continue
                     up=name.upper()
-                    if any(k in up for k in ["M4","KEYBOARD","KB","BT-KEY","HID"]):
+                    if any(k in up for k in KB_NAME_HINTS):
                         self.fd=os.open(path,os.O_RDONLY|os.O_NONBLOCK)
                         self.path=path
                         print(f"Keyboard: {name} at {path}")
