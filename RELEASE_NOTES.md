@@ -1,49 +1,74 @@
-# KidPager 0.9 — Release notes
+# KidPager v0.9
 
-First public release. The project is running on two devices (`kidpager.local` and `kidpager2.local`) and has moved past the hardware prototyping stage.
+First tagged public release. Both pagers run the same code; each one can send
+and receive messages independently.
 
-## Highlights
+## What works
 
-- **Working two-device LoRa messaging** at 868 MHz with ACK-based delivery status.
-- **Passive piezo buzzer** via hardware PWM (pigpio) — silent on the CPU side, does not interfere with E-Ink SPI.
-- **Single-battery power topology**: one LiPo feeds both the Pi (via CKCS boost to 5 V) and the M4 keyboard (direct 3.7 V to the keyboard's own pad).
-- **No GPS / NTP / DCF77.** Relative timestamps only (`now`, `5m`, `2h`, `1d`).
-- **Windows-based deployment** over SSH via `deploy.ps1` to multiple devices in one command.
+- Two-way messaging with retry indicator (`·` pending → `✓` delivered → `✗` timeout)
+- BT Classic keyboard (M4) attached as HID, survives sleep/wake
+- E-Ink refreshes off the main loop (background worker thread)
+- Persistent history with periodic flush (2 s) to reduce SD card wear
+- Four-tone buzzer: sent, incoming, ack, error
+- LoRa group isolation via channel byte in the packet header
+- Diagnostics script verifies every component end-to-end
 
 ## Hardware state
 
-- Raspberry Pi Zero 2 W with pre-soldered headers.
-- Waveshare 2.13" E-Ink HAT V4 on top.
-- SX1276 LoRa module wired directly to the Pi header pins (no passthrough PCB) — 8 wires soldered as ring-loops into the gap between Pi and HAT.
-- CKCS Mini Boost 10 W (replaces the earlier MT3608 which could not sustain current under LoRa TX + E-Ink refresh).
-- LiPo 3.7 V 2000 mAh with internal BMS.
-- Passive piezo (optional) with 100–220 Ω series resistor on GPIO 13.
+- Raspberry Pi Zero 2 W, Raspberry Pi OS Bookworm, Python 3.13
+- Waveshare 2.13" E-Ink HAT V4
+- **SX1262 LoRa module (Waveshare Core1262-HF)** — 868 MHz, +22 dBm max,
+  TCXO on DIO3, external RF switch on DIO2
+- M4 Bluetooth Classic keyboard
+- LiPo 2000 mAh + CKCS boost
 
-## What's new since prototypes
+**Migration note:** v0.9 is the first release on SX1262. If you had a
+pre-release build running on SX1276, solder one new wire (GPIO 23 →
+SX1262 BUSY, phys pin 16) before deploying. Nothing else changes on the
+hardware side. Over-the-air packet format is identical.
 
-Compared to the earlier ESP32 / Heltec Wireless Paper prototypes:
+## Pair the M4 keyboard
 
-- Moved from Arduino/C++ to Python 3 + asyncio.
-- Full Linux stack (BlueZ, systemd, Python) instead of bare-metal BT-HID workarounds.
-- SD-card-friendly history persistence (dirty-flag + periodic flush, ~2 s interval).
-- Bluetooth Classic pairing works reliably through a single-session `bluetoothctl` script (the gotcha that bit us for a week).
+```bash
+ssh pi@kidpager.local
+sudo ~/bt_pair.sh
+```
+
+Then on the other pager:
+
+```bash
+ssh pi@kidpager2.local
+sudo ~/bt_pair.sh
+```
+
+Script runs pair / trust / connect in one piped `bluetoothctl` session —
+the SSP agent must stay alive across the whole sequence, otherwise the
+link key doesn't persist and the keyboard reconnects as "Bonded: no"
+which prevents HID attachment.
+
+## Verify
+
+```bash
+cd ~/kidpager && sudo python3 diagnose.py -y
+```
+
+Expected: ~33 `OK`, 0 `FAIL`, 0 `WARN` on both pagers. After that:
+
+```powershell
+.\deploy.ps1 -Restart
+```
+
+and start sending messages.
 
 ## Known limitations
 
-- Battery life ~6 h with a 2000 mAh LiPo. A 4000 mAh cell would comfortably hit the 12 h target.
-- No WiFi transport. The `channel` field in the profile menu provides lightweight LoRa group isolation — the receiver drops packets whose channel byte does not match.
-- No encryption. This was a deliberate simplification for v0.9.
-- No OTA update mechanism — updates go through `deploy.ps1` over SSH.
-
-## Known gotchas (baked into the code)
-
-- **E-Ink BUSY stuck after power interruption** — fixed by `_hw_reset()` before driver import in `display_eink.py`.
-- **BlueZ pair/trust/connect** must run in a single `bluetoothctl` session — handled by `bt_pair.sh`.
-- **Software PWM corrupts E-Ink partial refresh** — use `pigpio.hardware_PWM` for the buzzer (this release).
-- **`RPi.GPIO` and `pigpio` both touch `/dev/gpiomem`** — the code orders initialisation so each owns only its own pins.
-
-## Thanks
-
-To the M4 keyboard for dying valiantly during polarity testing, to the first MT3608 boost that refused to tell us it was broken, and to the E-Ink BUSY pin that got stuck just often enough to be interesting.
-
-— Stan, April 2026
+- TX power is set to 22 dBm (Waveshare Core1262-HF high-power PA config).
+  EU 868 MHz regulations vary by sub-band — drop `LORA_POWER` in `pins.py`
+  to 14 or 17 if you need stricter compliance.
+- M4 keyboard goes to sleep after ~30 s of idle. First keypress after sleep
+  is lost during reconnect (~1-2 s). This is a peripheral-side design
+  decision; no host-side wake protocol is available for consumer BT-Classic
+  HID keyboards.
+- Relative time only ("только что", "5 мин назад") — no NTP/GPS/DCF77 sync.
+  Deliberate: real-time clock adds complexity without meaningful UX gain at
+  this scope.

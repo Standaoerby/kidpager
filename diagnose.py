@@ -79,12 +79,6 @@ def check_modules():
         except Exception as e:
             check(mod, "fail", str(e)[:60])
 
-    # Waveshare driver is NOT import-checked here: its internal gpiozero/lgpio
-    # backend requires exclusive GPIO access via /dev/gpiochip0, which clashes
-    # with a running kidpager service and produces a spurious "GPIO busy" fail.
-    # File presence is verified in [Files]; functional import is exercised by
-    # the [E-Ink display] hardware test after the service has been stopped.
-
     try:
         import pigpio
         pi = pigpio.pi()
@@ -105,8 +99,8 @@ def check_files():
         p = code / f
         check(f"~/kidpager/{f}", "pass" if p.exists() else "fail")
 
-    ws = Path("/home/pi/waveshare_epd/epd2in13_V4.py")
-    check("~/waveshare_epd/epd2in13_V4.py", "pass" if ws.exists() else "fail")
+    waveshare = Path("/home/pi/waveshare_epd/epd2in13_V4.py")
+    check("~/waveshare_epd/epd2in13_V4.py", "pass" if waveshare.exists() else "fail")
 
     # Service runs as User=root, so persistent state lives under /root
     for base in ("/root/.kidpager", "/home/pi/.kidpager"):
@@ -153,25 +147,19 @@ def check_bluetooth():
     check("Paired keyboard", "pass", f"{name} ({mac})")
 
     _, info = sh(f"bluetoothctl info {mac}")
+    connected = f"Connected: yes" in info
     for prop in ("Paired", "Bonded", "Trusted", "Connected"):
         yes = f"{prop}: yes" in info
-        if yes:
-            check(f"  {prop}", "pass")
-        elif prop == "Paired":
-            check(f"  {prop}", "fail", "pairing lost — re-run bt_pair.sh")
-        elif prop == "Bonded":
-            check(f"  {prop}", "fail",
-                  "HID will not attach without a stored link key — re-run bt_pair.sh")
-        elif prop == "Trusted":
-            check(f"  {prop}", "fail",
-                  f"no auto-reconnect — run: bluetoothctl trust {mac}")
-        elif prop == "Connected":
-            check(f"  {prop}", "warn",
-                  "keyboard may be off, out of range, or just not reconnected yet")
+        if prop == "Bonded" and not yes:
+            check(f"  {prop}", "fail", "HID won't attach without bond — re-run bt_pair.sh")
+        elif prop == "Trusted" and not yes:
+            check(f"  {prop}", "fail", f"run: bluetoothctl trust {mac}")
+        elif prop == "Connected" and not yes:
+            check(f"  {prop}", "warn", "keyboard offline (asleep or powered off)")
+        else:
+            check(f"  {prop}", "pass" if yes else "fail")
 
-    # Input event device — only a hard fail if the keyboard should be connected
-    # but isn't attached as HID; if it's simply disconnected right now, warn.
-    connected = "Connected: yes" in info
+    # Input event device — only relevant if keyboard is actually connected
     _, evs = sh("ls /dev/input/event*")
     found = None
     for ev in evs.split():
@@ -186,41 +174,65 @@ def check_bluetooth():
     if found:
         check("Input event device", "pass", f"{found[0]} = {found[1]}")
     elif connected:
-        check("Input event device", "fail",
-              "BT says connected but no HID event device — re-run bt_pair.sh")
+        check("Input event device", "fail", "connected but no HID attachment")
     else:
-        check("Input event device", "warn",
-              "keyboard not currently attached (power on the M4 and wait)")
+        check("Input event device", "warn", "no event device (OK if keyboard offline)")
 
 
 # ---------- Hardware checks (need service stopped) ----------
 
 def check_lora(quick=False):
-    section("LoRa radio (SX1276)")
+    section("LoRa radio (SX1262)")
     sys.path.insert(0, "/home/pi/kidpager")
     try:
         import spidev
         import RPi.GPIO as GPIO
-        from pins import LORA_RST, SPI_BUS, LORA_FREQ, LORA_SF, LORA_BW
+        from pins import (LORA_RST, LORA_BUSY, SPI_BUS,
+                          LORA_FREQ, LORA_SF, LORA_BW, LORA_POWER)
 
         GPIO.setwarnings(False); GPIO.setmode(GPIO.BCM)
-        GPIO.setup(LORA_RST, GPIO.OUT)
-        GPIO.output(LORA_RST, GPIO.LOW); time.sleep(0.01)
-        GPIO.output(LORA_RST, GPIO.HIGH); time.sleep(0.05)
+        GPIO.setup(LORA_RST,  GPIO.OUT)
+        GPIO.setup(LORA_BUSY, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+        # Reset pulse
+        GPIO.output(LORA_RST, GPIO.LOW);  time.sleep(0.001)
+        GPIO.output(LORA_RST, GPIO.HIGH); time.sleep(0.010)
+
+        # Wait BUSY LOW — this is the critical SX1262 handshake
+        t0 = time.time()
+        busy_ok = True
+        while GPIO.input(LORA_BUSY):
+            if time.time() - t0 > 0.1:
+                busy_ok = False; break
+            time.sleep(0.0001)
+
+        if not busy_ok:
+            GPIO.cleanup()
+            check("BUSY LOW after reset", "fail",
+                  "stuck HIGH — check LORA_BUSY wiring (GPIO 23, phys pin 16)")
+            return
+        check("BUSY LOW after reset", "pass")
+
         spi = spidev.SpiDev(); spi.open(SPI_BUS, 1)
         spi.max_speed_hz = 1_000_000; spi.mode = 0
-        ver = spi.xfer2([0x42, 0x00])[1]
+
+        # GetStatus (0xC0) — chipmode bits [6:4] should be 0x2 (STDBY_RC) after reset
+        r = spi.xfer2([0xC0, 0x00])
+        status = r[1]
+        chipmode = (status >> 4) & 0x07
         spi.close()
         GPIO.cleanup()
 
-        if ver == 0x12:
-            check("SX1276 version register", "pass", "0x12")
+        modes = {0x02: "STDBY_RC", 0x03: "STDBY_XOSC"}
+        if chipmode in modes:
+            check("SX1262 GetStatus", "pass",
+                  f"status=0x{status:02X} chipmode={modes[chipmode]}")
         else:
-            check("SX1276 version register", "fail",
-                  f"got 0x{ver:02X}, expected 0x12 (check wiring/CS/power)")
+            check("SX1262 GetStatus", "fail",
+                  f"status=0x{status:02X} chipmode=0x{chipmode} (expected STDBY)")
             return
     except Exception as e:
-        check("SX1276 version register", "fail", str(e)[:60])
+        check("SX1262 GetStatus", "fail", str(e)[:60])
         return
 
     if quick:
@@ -235,7 +247,8 @@ def check_lora(quick=False):
         ok = radio.init()
         if ok:
             check("Radio init + RX mode", "pass",
-                  f"{LORA_FREQ}MHz SF{LORA_SF} BW{LORA_BW}kHz ch={cfg.channel}")
+                  f"{LORA_FREQ}MHz SF{LORA_SF} BW{LORA_BW}kHz "
+                  f"+{LORA_POWER}dBm ch={cfg.channel}")
             radio.cleanup()
         else:
             check("Radio init + RX mode", "fail")
@@ -257,7 +270,7 @@ def check_eink(quick=False):
             check("BUSY pin idle (LOW)", "pass")
         else:
             check("BUSY pin idle (LOW)", "warn",
-                  "HIGH — display may be mid-refresh or wedged; _hw_reset should unstick it")
+                  "HIGH — display may not be in deep sleep from last run; hw_reset will fix")
     except Exception as e:
         check("BUSY pin idle (LOW)", "fail", str(e)[:60])
 
@@ -280,12 +293,9 @@ def check_eink(quick=False):
         draw.text((10, 40), f"time: {time.strftime('%H:%M:%S')}", fill=0)
         draw.text((10, 70), "E-Ink draw OK", fill=0)
         d._submit(img)
-        time.sleep(3)  # let background worker render
-        # Stop the worker first so no stale frames can hit a sleeping display,
-        # then put the display in deep sleep so BUSY goes LOW and subsequent
-        # runs don't warn about BUSY stuck HIGH.
-        d.cleanup()
-        d.sleep()
+        time.sleep(3)   # let background worker render
+        d.cleanup()     # stop worker thread first (joins with timeout)
+        d.sleep()       # then put display in deep sleep (BUSY drops LOW)
         check("Draw test (worker thread)", "pass", "check the screen — should show DIAGNOSTICS")
     except Exception as e:
         check("Draw test (worker thread)", "fail", str(e)[:80])
