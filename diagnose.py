@@ -50,8 +50,14 @@ def sh(cmd, timeout=5):
 
 def check_system():
     section("System")
+    # Both CE0 (E-Ink) and CE1 (LoRa) are required. Enabling SPI normally creates
+    # both device nodes; a missing spidev0.1 usually means SPI is enabled but CE1
+    # is redirected by an overlay (e.g. some HATs claim it).
     rc, _ = sh("ls /dev/spidev0.0")
-    check("SPI bus /dev/spidev0.0", "pass" if rc == 0 else "fail")
+    check("SPI bus /dev/spidev0.0 (E-Ink CE0)", "pass" if rc == 0 else "fail")
+    rc, _ = sh("ls /dev/spidev0.1")
+    check("SPI bus /dev/spidev0.1 (LoRa CE1)", "pass" if rc == 0 else "fail",
+          "" if rc == 0 else "enable with: sudo raspi-config nonint do_spi 0  (or check dtoverlay conflicts)")
 
     rc, _ = sh("systemctl is-active bluetooth")
     check("bluetooth.service active", "pass" if rc == 0 else "fail")
@@ -68,6 +74,21 @@ def check_system():
 
     fonts = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").exists()
     check("DejaVu fonts installed", "pass" if fonts else "fail")
+
+    # SD free space — history.json grows to ~40 KB for 100 messages, trivial —
+    # but a full SD would block config saves and flush_history silently.
+    rc, out = sh("df -BM / | tail -1 | awk '{print $4}'")
+    if rc == 0 and out:
+        try:
+            mb = int(out.rstrip("M"))
+            if mb < 100:
+                check("SD free space", "fail", f"{mb} MB — clean up before deploy")
+            elif mb < 500:
+                check("SD free space", "warn", f"{mb} MB")
+            else:
+                check("SD free space", "pass", f"{mb} MB free")
+        except ValueError:
+            check("SD free space", "warn", f"could not parse: {out}")
 
 
 def check_modules():
@@ -89,6 +110,18 @@ def check_modules():
             check("pigpio daemon connection", "fail", "socket unreachable")
     except Exception as e:
         check("pigpio daemon connection", "fail", str(e)[:60])
+
+    # Project modules — catches a missing file or a broken import chain
+    # before we start doing hardware tests. Skip ui/display_eink/main:
+    # display_eink has side-effects on import (hw_reset), ui imports it,
+    # main runs asyncio.run() at import time would be unsafe.
+    sys.path.insert(0, "/home/pi/kidpager")
+    for mod in ("pins", "config", "power", "buzzer", "keyboard", "lora"):
+        try:
+            __import__(mod)
+            check(f"kidpager/{mod}.py import", "pass")
+        except Exception as e:
+            check(f"kidpager/{mod}.py import", "fail", str(e)[:60])
 
 
 def check_files():
@@ -121,6 +154,21 @@ def check_files():
                 check(f"{base}/history.json", "pass", f"{len(data)} messages")
             except Exception as e:
                 check(f"{base}/history.json", "fail", f"invalid JSON: {e}")
+
+    # Writability check: the service runs as root and needs to persist config/history
+    # to /root/.kidpager. A read-only mount or SELinux-like lockdown would break save.
+    root_cfg = Path("/root/.kidpager")
+    if root_cfg.exists():
+        try:
+            probe = root_cfg / ".diag_probe"
+            probe.write_text("ok")
+            probe.unlink()
+            check("/root/.kidpager writable", "pass")
+        except Exception as e:
+            check("/root/.kidpager writable", "fail", str(e)[:60])
+    else:
+        check("/root/.kidpager exists", "warn",
+              "created on first run by service — OK if pager never started yet")
 
 
 def check_bluetooth():
@@ -301,6 +349,43 @@ def check_eink(quick=False):
         check("Draw test (worker thread)", "fail", str(e)[:80])
 
 
+def check_power():
+    section("Power config")
+
+    rc, out = sh("systemctl is-active kidpager-power")
+    check("kidpager-power.service active", "pass" if rc == 0 else "fail", out)
+
+    rc, out = sh("rfkill list wifi")
+    blocked = "Soft blocked: yes" in out
+    # Wi-Fi state is a user choice at runtime, so "on" is WARN (not FAIL) —
+    # leaving it on costs ~40-60 mA but may be intentional during debugging.
+    if blocked:
+        check("Wi-Fi blocked (power-saving)", "pass", "toggle via Alt+W on pager")
+    else:
+        check("Wi-Fi blocked (power-saving)", "warn",
+              "currently ON — Alt+W on pager to re-block")
+
+    try:
+        gov = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read_text().strip()
+        check("CPU governor", "pass" if gov == "powersave" else "warn", gov)
+    except Exception as e:
+        check("CPU governor", "fail", str(e)[:60])
+
+    for path in ("/sys/class/leds/ACT/trigger", "/sys/class/leds/led0/trigger"):
+        if os.path.exists(path):
+            t = Path(path).read_text().strip()
+            ok = "[none]" in t
+            check("ACT LED disabled", "pass" if ok else "warn",
+                  f"{os.path.basename(os.path.dirname(path))}: {t[:40]}")
+            break
+    else:
+        check("ACT LED trigger", "warn", "no /sys/class/leds node found")
+
+    script = Path("/usr/local/bin/kidpager-power.sh")
+    check("kidpager-power.sh installed", "pass" if script.is_file() else "fail",
+          "owned by kidpager-power.service" if script.is_file() else "")
+
+
 def check_buzzer(quick=False):
     section("Buzzer (GPIO 13, pigpio hardware PWM)")
     if quick:
@@ -365,6 +450,7 @@ def main():
     check_modules()
     check_files()
     check_bluetooth()
+    check_power()
 
     if args.skip_hw:
         section("Hardware")

@@ -52,8 +52,12 @@ class KeyboardReader:
     def __init__(self):
         self.fd=None;self.path=None;self.shift=False;self.alt=False
 
-    def find_m4(self):
-        for attempt in range(6):
+    def find_m4(self, attempts=6, delay=5.0, verbose=True):
+        """Scan /dev/input for a keyboard matching KB_NAME_HINTS.
+        attempts=6 + delay=5.0 (default) is tuned for cold boot where BT needs time
+        to associate. Runtime reconnect should pass attempts=1 to avoid freezing
+        the main loop for 30 s when the M4 goes to sleep."""
+        for attempt in range(attempts):
             for path in sorted(glob.glob("/dev/input/event*")):
                 try:
                     np=f"/sys/class/input/{os.path.basename(path)}/device/name"
@@ -67,15 +71,18 @@ class KeyboardReader:
                     if any(k in up for k in KB_NAME_HINTS):
                         self.fd=os.open(path,os.O_RDONLY|os.O_NONBLOCK)
                         self.path=path
-                        print(f"Keyboard: {name} at {path}")
+                        if verbose:
+                            print(f"Keyboard: {name} at {path}")
                         return True
                 except Exception:
                     continue
-            if attempt<5:
-                print(f"  Waiting for BT keyboard... ({attempt+1}/6)")
+            if attempt<attempts-1:
+                if verbose:
+                    print(f"  Waiting for BT keyboard... ({attempt+1}/{attempts})")
                 _bt_try()
-                time.sleep(5)
-        print("No keyboard found")
+                time.sleep(delay)
+        if verbose:
+            print("No keyboard found")
         return False
 
     def read_key_sync(self):
@@ -106,6 +113,7 @@ class KeyboardReader:
             if code==KEY_RIGHT: return "RIGHT"
             if self.alt and code==24: return "UP"
             if self.alt and code==38: return "DOWN"
+            if self.alt and code==17: return "WIFI"   # Alt+W toggles Wi-Fi rfkill
             if self.shift and code in SHIFT_MAP:
                 return SHIFT_MAP[code]
             if code in KEYCODE_MAP:
@@ -127,10 +135,12 @@ class KeyboardReader:
             return False
 
     def reconnect(self):
+        """Runtime reconnect: single quick scan. If it misses, main loop retries
+        in ~5 s (kb_check cadence) — better than blocking for 30 s here."""
         self.close()
         _bt_try()
         time.sleep(2)
-        self.find_m4()
+        self.find_m4(attempts=1, verbose=False)
 
     def close(self):
         if self.fd is not None:

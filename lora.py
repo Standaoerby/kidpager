@@ -208,11 +208,14 @@ class LoRaRadio:
                 pass
             self.spi = None
 
-    def send(self, sender, text):
-        self.msg_counter += 1
-        msg_id = hashlib.md5(
-            f"{sender}{text}{time.time()}{self.msg_counter}".encode()
-        ).hexdigest()[:8]
+    def send(self, sender, text, msg_id=None):
+        # msg_id=None on first send -> generate; pass-through on retransmit so the
+        # receiver can dedupe on msg_id (ui.py add_message).
+        if msg_id is None:
+            self.msg_counter += 1
+            msg_id = hashlib.md5(
+                f"{sender}{text}{time.time()}{self.msg_counter}".encode()
+            ).hexdigest()[:8]
         nb = sender.encode("utf-8")[:16]
         tb = text.encode("utf-8")[:200]
         ib = msg_id.encode("ascii")

@@ -66,12 +66,16 @@ class EInkDisplay:
         self._thread.start()
         print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker)")
 
-    def draw_chat(self, name, channel, messages, input_text, lora_on=False):
+    def draw_chat(self, name, channel, messages, input_text, lora_on=False, wifi_on=False):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, WIDTH, 15], fill=0)
         lora = "LoRa" if lora_on else "----"
         d.text((3, 1), name, font=FONT_BD, fill=255)
+        # Header badge layout: `[name]              [W] [LoRa]`. W only appears when
+        # Wi-Fi is unblocked (debug mode); absence = radio off = power-saving state.
+        if wifi_on:
+            d.text((WIDTH - 45, 2), "W", font=FONT_BD, fill=255)
         d.text((WIDTH - 32, 2), lora, font=FONT_SM, fill=255)
         y = 18
         for msg in messages[-5:]:
@@ -114,6 +118,19 @@ class EInkDisplay:
         d.text((10, 42), "Name:", font=FONT, fill=0)
         d.rectangle([10, 60, WIDTH - 10, 78], outline=0)
         d.text((14, 62), name, font=FONT, fill=0)
+        self._submit(img)
+
+    def draw_channel_edit(self, channel):
+        img = Image.new("1", (WIDTH, HEIGHT), 255)
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, WIDTH, 15], fill=0)
+        d.text((3, 1), "EDIT CHANNEL", font=FONT_BD, fill=255)
+        d.text((10, 30), "Channel (1-99):", font=FONT, fill=0)
+        d.rectangle([10, 50, WIDTH - 10, 72], outline=0)
+        # `< N >` cue — arrows on the screen hint that arrow keys change the value.
+        d.text((18, 54), f"<   {channel}   >", font=FONT_BD, fill=0)
+        d.text((10, 82), "UP/DOWN or L/R: change", font=FONT_SM, fill=0)
+        d.text((10, 96), "ENTER: save", font=FONT_SM, fill=0)
         self._submit(img)
 
     def _submit(self, img):
