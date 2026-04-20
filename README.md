@@ -111,7 +111,6 @@ kidpager/
 ├── buzzer.py         passive buzzer (pigpio)
 ├── config.py         JSON config
 ├── pins.py           pin assignments + radio params
-├── main.py
 ├── diagnose.py       full health check
 ├── test_lora_spi.py  LoRa SPI smoke test
 ├── test_buzzer.py    buzzer tone test

@@ -16,25 +16,25 @@ async def main():
         print("  - Piezo (-) -> GND (phys pin 34)")
         return 1
 
-    print("\n1/4 tone sweep — should hear 500/1000/2000/3000 Hz")
+    print("\n1/5 tone sweep — should hear 500/1000/2000/3000 Hz")
     for f in (500, 1000, 2000, 3000):
         print(f"    {f} Hz")
         await b.tone(f, 200)
         await asyncio.sleep(0.15)
 
-    print("\n2/4 beep_incoming (two rising beeps — new message)")
+    print("\n2/5 beep_incoming (two rising beeps — new message)")
     await b.beep_incoming()
     await asyncio.sleep(0.6)
 
-    print("3/4 beep_sent (one short blip — message sent)")
+    print("3/5 beep_sent (one short blip — message sent)")
     await b.beep_sent()
     await asyncio.sleep(0.6)
 
-    print("4/4 beep_ack (soft confirm — delivery confirmed)")
+    print("4/5 beep_ack (soft confirm — delivery confirmed)")
     await b.beep_ack()
     await asyncio.sleep(0.6)
 
-    print("\n5 beep_error (descending — send failed)")
+    print("\n5/5 beep_error (descending — send failed)")
     await b.beep_error()
     await asyncio.sleep(0.6)
 
