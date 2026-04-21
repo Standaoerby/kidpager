@@ -22,13 +22,23 @@ param(
 
 $PAGERS = @("kidpager.local", "kidpager2.local")
 $KEY = "$env:USERPROFILE\.ssh\id_kidpager"
-$sshCmd = @("-F", "nul", "-i", $KEY, "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no")
+# UserKnownHostsFile=/dev/null + LogLevel=ERROR: survives SD re-flashes without
+# manual ssh-keygen -R. We're on a LAN and authenticating by key, so MITM risk
+# is equivalent to the regular StrictHostKeyChecking=no case we were using anyway.
+$sshCmd = @(
+    "-F", "nul",
+    "-i", $KEY,
+    "-o", "ConnectTimeout=5",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR"
+)
 # Production code + diagnose.py (diagnose is useful in the field).
 $PY_FILES = @("pins.py","lora.py","display_eink.py","config.py","keyboard.py","buzzer.py","ui.py","main.py","power.py","diagnose.py")
 # Developer-only smoke tests; only copied when -Tests is passed.
 $TEST_FILES = @("test_lora_spi.py","test_buzzer.py","test_power.py")
 
-# Service runs as User=root, so ~ expands to /root — history lives there.
+# Service runs as User=root, so ~ expands to /root - history lives there.
 # The /home/pi path is cleared too just to be thorough.
 $WIPE_CMD = "sudo systemctl stop kidpager 2>/dev/null; sudo rm -f /root/.kidpager/history.json /home/pi/.kidpager/history.json; sudo systemctl start kidpager 2>/dev/null; echo wiped"
 
@@ -36,7 +46,7 @@ if ($Setup) {
     if (!(Test-Path $KEY)) { ssh-keygen -t ed25519 -N '""' -f $KEY }
     foreach ($dest in $PAGERS) {
         Write-Host "Key -> $dest (password once)..." -ForegroundColor Cyan
-        type "${KEY}.pub" | ssh -F nul -o StrictHostKeyChecking=no "${PiUser}@${dest}" "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" 2>$null
+        Get-Content "${KEY}.pub" | ssh -F nul -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "${PiUser}@${dest}" "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" 2>$null
     }
     Write-Host "Done! Run: .\deploy.ps1 -All" -ForegroundColor Green; exit 0
 }
@@ -82,66 +92,17 @@ foreach ($dest in $targets) {
     if ($ok -ne "ok") { Write-Host "  UNREACHABLE" -ForegroundColor Red; continue }
 
     Write-Host "  [1/8] Packages" -ForegroundColor Cyan
-    ssh @sshCmd $t "sudo apt update -qq 2>/dev/null; sudo apt install -y python3-spidev python3-rpi.gpio python3-pil python3-gpiozero python3-pip git build-essential bluez fonts-dejavu-core wget rfkill 2>/dev/null | tail -1"
+    ssh @sshCmd $t "sudo apt update -qq 2>/dev/null; sudo apt install -y python3-spidev python3-rpi.gpio python3-pil python3-gpiozero python3-pigpio bluez fonts-dejavu-core wget rfkill 2>/dev/null | tail -1"
 
-    Write-Host "  [2/8] SPI + pigpio (build from source on Bookworm)" -ForegroundColor Cyan
-    # pigpio was removed from Raspberry Pi OS Bookworm repos (doesn't support RP1 on Pi 5).
-    # For Pi Zero/2/3/4 it still works: build C library from source, install Python module
-    # via pip (setup.py uses removed distutils), and drop in the systemd unit manually.
+    Write-Host "  [2/8] SPI + pigpiod" -ForegroundColor Cyan
+    # Trixie has python3-pigpio in apt (installed in [1/8]). Just enable SPI,
+    # start pigpiod, and verify. Previously we built pigpio from source for
+    # Bookworm (where it was dropped from the repos); no longer needed.
     ssh @sshCmd $t @"
 sudo raspi-config nonint do_spi 0 2>/dev/null
-
-# Build and install the C library/daemon if missing
-if [ ! -x /usr/local/bin/pigpiod ]; then
-    echo '  Building pigpio from source...'
-    cd /tmp && rm -rf pigpio
-    git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1
-    cd pigpio && make -j4 >/dev/null 2>&1
-    # make install Python step fails on Py3.12 (distutils removed). Ignore that;
-    # the binary/lib install steps before it still succeed.
-    sudo make install 2>/dev/null || true
-    # Refresh dynamic linker cache so pigpiod can find libpigpio.so.1 in /usr/local/lib
-    sudo ldconfig
-    # Drop in the systemd unit manually (make install exits before it otherwise)
-    if [ ! -f /lib/systemd/system/pigpiod.service ]; then
-        sudo cp /tmp/pigpio/util/pigpiod.service /lib/systemd/system/ 2>/dev/null || \
-        sudo tee /lib/systemd/system/pigpiod.service >/dev/null <<'UNIT'
-[Unit]
-Description=Daemon required to control GPIO pins via pigpio
-
-[Service]
-ExecStart=/usr/local/bin/pigpiod -l
-ExecStop=/bin/systemctl kill pigpiod
-Type=forking
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-    fi
-    echo '  pigpio C library installed'
-else
-    echo '  pigpio C library already present'
-fi
-
-# Python module — via pip, since setup.py is broken on Py3.12.
-# NOTE: the pip wheel drops its own pigpiod.service at /usr/lib/systemd/system/
-# that expects the binary at /usr/bin/pigpiod. Our source build put it in
-# /usr/local/bin/, so we symlink to keep whichever unit file wins happy.
-if ! python3 -c 'import pigpio' 2>/dev/null; then
-    sudo pip3 install pigpio --break-system-packages >/dev/null 2>&1
-    echo '  pigpio Python module installed via pip'
-else
-    echo '  pigpio Python module already installed'
-fi
-
-if [ -x /usr/local/bin/pigpiod ] && [ ! -e /usr/bin/pigpiod ]; then
-    sudo ln -s /usr/local/bin/pigpiod /usr/bin/pigpiod
-    echo '  symlinked /usr/bin/pigpiod -> /usr/local/bin/pigpiod'
-fi
-
-sudo systemctl daemon-reload
 sudo systemctl enable pigpiod --now 2>/dev/null
 systemctl is-active pigpiod 2>/dev/null | grep -q active && echo '  pigpiod: active' || echo '  pigpiod: FAILED'
+python3 -c 'import pigpio' 2>/dev/null && echo '  pigpio module: OK' || echo '  pigpio module: FAILED'
 "@
 
     Write-Host "  [3/8] Waveshare" -ForegroundColor Cyan
@@ -174,7 +135,9 @@ systemctl is-active pigpiod 2>/dev/null | grep -q active && echo '  pigpiod: act
     ssh @sshCmd $t "sudo install -m 755 ~/kidpager-power.sh /usr/local/bin/kidpager-power.sh && rm ~/kidpager-power.sh"
 
     Write-Host "  [5/8] Config" -ForegroundColor Cyan
-    ssh @sshCmd $t "test -f ~/.kidpager/config.json || echo '{""name"":""Kid"",""channel"":1}' > ~/.kidpager/config.json"
+    # Remove stale /home/pi/.kidpager/config.json from pre-v0.9 deploys; live
+    # config lives in /root/.kidpager/ because the service runs as root.
+    ssh @sshCmd $t "sudo rm -f /home/pi/.kidpager/config.json; sudo mkdir -p /root/.kidpager; sudo test -f /root/.kidpager/config.json || echo '{""name"":""Kid"",""channel"":1}' | sudo tee /root/.kidpager/config.json >/dev/null"
 
     Write-Host "  [6/8] Service" -ForegroundColor Cyan
     ssh @sshCmd $t "sudo bash -c 'cat > /etc/systemd/system/kidpager.service << SVCEOF
@@ -200,6 +163,11 @@ systemctl daemon-reload && systemctl enable kidpager && echo OK'"
     # Runs /usr/local/bin/kidpager-power.sh once at boot: rfkill wifi, powersave
     # governor, ACT LED off. Listed as Before=kidpager.service so the main pager
     # starts in the already-saved state.
+    #
+    # IMPORTANT: enable WITHOUT --now. The oneshot does 'rfkill block wifi', which
+    # severs the SSH connection we're deploying over. Power-save activates on the
+    # next boot; this is harmless because the Pi will reboot at the end of field
+    # setup anyway.
     ssh @sshCmd $t "sudo bash -c 'cat > /etc/systemd/system/kidpager-power.service << PWREOF
 [Unit]
 Description=KidPager power-saving (rfkill wifi, powersave governor, LED off)
@@ -212,10 +180,12 @@ ExecStart=/usr/local/bin/kidpager-power.sh
 [Install]
 WantedBy=multi-user.target
 PWREOF
-systemctl daemon-reload && systemctl enable --now kidpager-power && echo OK'"
+systemctl daemon-reload && systemctl enable kidpager-power && echo OK'"
 
     Write-Host "  [8/8] Verify" -ForegroundColor Cyan
-    ssh @sshCmd $t "echo '---'; test -f ~/waveshare_epd/epd2in13_V4.py && echo '[OK] Waveshare' || echo '[!!] Waveshare'; test -f ~/kidpager/main.py && echo '[OK] Code' || echo '[!!] Code'; test -x /usr/local/bin/kidpager-power.sh && echo '[OK] Power script' || echo '[!!] Power script'; ls /dev/spidev0.0 >/dev/null 2>&1 && echo '[OK] SPI' || echo '[!!] SPI'; test -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf && echo '[OK] Fonts' || echo '[!!] Fonts'; systemctl is-enabled kidpager 2>/dev/null | grep -q enabled && echo '[OK] Autostart' || echo '[!!] Autostart'; systemctl is-active kidpager-power 2>/dev/null | grep -q active && echo '[OK] Power-save' || echo '[!!] Power-save'; systemctl is-active pigpiod 2>/dev/null | grep -q active && echo '[OK] pigpiod' || echo '[!!] pigpiod'; python3 -c 'import pigpio' 2>/dev/null && echo '[OK] pigpio module' || echo '[!!] pigpio module'; rfkill list wifi 2>/dev/null | grep -q 'Soft blocked: yes' && echo '[OK] Wi-Fi blocked' || echo '[!!] Wi-Fi NOT blocked'; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null | grep -q powersave && echo '[OK] CPU powersave' || echo '[!!] CPU governor'; echo 'BT:'; bluetoothctl devices 2>/dev/null; echo '---'"
+    # Note: Wi-Fi-blocked check is intentionally omitted - it would always show
+    # FAIL until first reboot (see step 7/8 comment).
+    ssh @sshCmd $t "echo '---'; test -f ~/waveshare_epd/epd2in13_V4.py && echo '[OK] Waveshare' || echo '[!!] Waveshare'; test -f ~/kidpager/main.py && echo '[OK] Code' || echo '[!!] Code'; test -x /usr/local/bin/kidpager-power.sh && echo '[OK] Power script' || echo '[!!] Power script'; ls /dev/spidev0.0 >/dev/null 2>&1 && echo '[OK] SPI' || echo '[!!] SPI'; test -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf && echo '[OK] Fonts' || echo '[!!] Fonts'; systemctl is-enabled kidpager 2>/dev/null | grep -q enabled && echo '[OK] Autostart' || echo '[!!] Autostart'; systemctl is-enabled kidpager-power 2>/dev/null | grep -q enabled && echo '[OK] Power-save enabled (active after reboot)' || echo '[!!] Power-save not enabled'; systemctl is-active pigpiod 2>/dev/null | grep -q active && echo '[OK] pigpiod' || echo '[!!] pigpiod'; python3 -c 'import pigpio' 2>/dev/null && echo '[OK] pigpio module' || echo '[!!] pigpio module'; echo 'BT:'; bluetoothctl devices 2>/dev/null; echo '---'"
 
     if ($WipeHistory) {
         Write-Host "  [+]   Wipe history" -ForegroundColor Magenta
@@ -226,3 +196,5 @@ systemctl daemon-reload && systemctl enable --now kidpager-power && echo OK'"
 }
 
 Write-Host "`n=== Complete ===" -ForegroundColor Green
+Write-Host "Power-save activates on next reboot." -ForegroundColor Yellow
+Write-Host "After reboot, Wi-Fi is blocked. Alt+W on the M4 re-enables it for redeploys." -ForegroundColor Yellow
