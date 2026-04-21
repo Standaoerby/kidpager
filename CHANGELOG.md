@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.10 — 2026-04-21
+
+### Changed
+- **Message rendering is now multi-line.** Long messages are word-wrapped to
+  fit the 250 px width instead of being truncated to 32 characters with `..`.
+  Continuation lines are indented 2 spaces so they visually link to the
+  parent message. Words longer than the screen width fall back to
+  character-break.
+- **E-Ink layout.** Message area holds 6 text lines (14 px each, was 5 × 17).
+  A very long message can now push older messages off-screen; use `UP`/`DOWN`
+  to scroll back, same as before. Scroll bound extended so the user can
+  reach the very first message in history.
+- **Refresh strategy explicit.** Typing triggers two-pronged debounce:
+  `TYPING_SETTLE = 0.3 s` (redraw after the user pauses) plus
+  `TYPING_MAX_STALE = 1.5 s` (force-redraw during continuous typing so the
+  user sees what they're entering on the E-Ink, not just the SSH terminal).
+  Non-typing events (incoming message, ack, profile navigation) bypass
+  debounce and redraw immediately. Strategy documented at the top of
+  `main.py`.
+- **Input line tail-view.** When the input buffer overflows the visible
+  width, leading characters are dropped (not trailing) and a `>.` prefix
+  indicates truncation, so the user always sees what they just typed.
+
+### Added
+- **Timestamps on the E-Ink.** Each message now shows a relative time
+  (`now`, `5m`, `2h`, `3d`) right-aligned at the top of its first line in
+  small font. Matches the terminal output.
+- **Visible retry indicator.** While a message is being retransmitted, its
+  status badge shows the attempt count: `[~1]`, `[~2]`, ... instead of a
+  bare `[~]`. The user can tell at a glance whether a stuck message is
+  still trying or has given up (`[x]`).
+- **`test_retry.py`** — 7 unit tests covering the retry state machine:
+  initial state, no-retry-before-timeout, retry fires with same `msg_id`,
+  MAX_RETRIES exhaustion → FAIL, ack halts retry sequence, incoming dedup
+  on repeated `msg_id`, graceful degradation when `lora=None`. Uses mock
+  LoRa and mock E-Ink; runs without any hardware. Shipped with
+  `deploy.ps1 -Tests`.
+
+### Unchanged (but worth noting)
+- Retry timing parameters are the same as v0.9:
+  `ACK_TIMEOUT = 4 s`, `MAX_RETRIES = 2` (→ 3 total attempts),
+  `check_timeouts()` runs every 2 s from the main loop.
+  Worst-case time-to-FAIL is ~14 s. Constants exposed at the top of `ui.py`
+  with a docstring explaining the policy.
+- Packet format on the air is identical — no over-the-air breakage.
+
 ## v0.9 — 2026-04-20
 
 ### Changed

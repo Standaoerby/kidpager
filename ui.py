@@ -1,4 +1,16 @@
-"""UI module for KidPager."""
+"""UI module for KidPager.
+
+Retry policy for outgoing messages:
+  ACK_TIMEOUT       seconds per attempt (send + expected ack round-trip)
+  MAX_RETRIES       number of retransmits after the first send
+  CHECK_INTERVAL    how often main.py calls check_timeouts()
+Total attempts = 1 initial + MAX_RETRIES retries = 3 by default.
+Worst-case time to FAIL = (MAX_RETRIES + 1) * ACK_TIMEOUT + CHECK_INTERVAL.
+With defaults = 3 * 4 + 2 = 14 s.
+
+While a message is being retransmitted, its status stays STATUS_SENDING (`~`)
+but the UI shows `~1`, `~2`, ... so the user can see the attempt count.
+"""
 import time, sys, json, os
 
 try:
@@ -12,10 +24,20 @@ STATUS_LOCAL = "."
 STATUS_SENDING = "~"
 STATUS_OK = "+"
 STATUS_FAIL = "x"
+
 ACK_TIMEOUT = 4        # seconds per attempt (send + ack round-trip)
-MAX_RETRIES = 2        # retransmit count before giving up (total attempts = 1 + MAX_RETRIES)
+MAX_RETRIES = 2        # retransmit count; total attempts = 1 + MAX_RETRIES
+CHECK_INTERVAL = 2     # seconds between check_timeouts() calls (informational;
+                       # main.py enforces the cadence)
+
 HISTORY_FILE = os.path.expanduser("~/.kidpager/history.json")
 MAX_HISTORY = 100
+
+# How many past messages we hand to the display layer. More than fits on-screen,
+# so the display can word-wrap and still show the latest MAX_MSG_LINES lines
+# even when recent messages span multiple visual lines each.
+EINK_WINDOW = 30
+
 
 def relative_time(ts):
     diff = time.time() - ts
@@ -24,6 +46,7 @@ def relative_time(ts):
     elif diff < 3600: return f"{int(diff/60)}m"
     elif diff < 86400: return f"{int(diff/3600)}h"
     else: return f"{int(diff/86400)}d"
+
 
 class Message:
     def __init__(self, sender, text, outgoing=False, msg_id=None, timestamp=None, status=None):
@@ -49,6 +72,7 @@ class Message:
         return Message(sender=d["sender"],text=d["text"],outgoing=d.get("outgoing",False),
                       msg_id=d.get("msg_id"),timestamp=d.get("timestamp"),status=d.get("status",STATUS_LOCAL))
 
+
 class PagerUI:
     def __init__(self, config, lora=None):
         self.config = config
@@ -59,7 +83,7 @@ class PagerUI:
         self.profile_sel = 0
         self.eink = None
         self.wifi_on = False   # set by main.py from power.wifi_is_enabled()
-        self._dirty = False  # history needs flushing to disk
+        self._dirty = False    # history needs flushing to disk
         self._load_history()
         if HAS_EINK:
             try:
@@ -74,10 +98,12 @@ class PagerUI:
                 self.messages = [Message.from_dict(d) for d in data[-MAX_HISTORY:]]
                 for m in self.messages:
                     if m.status == STATUS_SENDING:
+                        # In-flight retries don't survive a restart: flip to FAIL
+                        # so the user can see what didn't get through.
                         m.status = STATUS_FAIL
-                        self._dirty = True  # sender -> failed needs saving
+                        self._dirty = True
                 print(f"Loaded {len(self.messages)} messages")
-        except:
+        except Exception:
             self.messages = []
 
     def flush_history(self):
@@ -110,14 +136,19 @@ class PagerUI:
     def _handle_chat(self, key):
         if key == "ENTER": return "send"
         elif key == "BACKSPACE": self.input_buf = self.input_buf[:-1]
-        elif key == "ESC" or key == "TAB": self.state = "profile"; self.profile_sel = 0; self.full_redraw()
+        elif key == "ESC" or key == "TAB":
+            self.state = "profile"; self.profile_sel = 0; self.full_redraw()
         elif key == "UP":
-            self.scroll = min(self.scroll + 1, max(0, len(self.messages) - 5))
+            # Scroll bound: messages may be multi-line, so we can't assume
+            # "show exactly 5 at a time". Allow scroll up to len(messages)-1
+            # so the user can reach the very first message if they want.
+            self.scroll = min(self.scroll + 1, max(0, len(self.messages) - 1))
             self.full_redraw()
         elif key == "DOWN":
             self.scroll = max(0, self.scroll - 1)
             self.full_redraw()
-        elif isinstance(key, str) and len(key) == 1: self.input_buf += key; self.scroll = 0
+        elif isinstance(key, str) and len(key) == 1:
+            self.input_buf += key; self.scroll = 0
         return None
 
     def _handle_profile(self, key):
@@ -127,7 +158,8 @@ class PagerUI:
             if self.profile_sel == 0: self.state = "name_edit"; self.full_redraw()
             elif self.profile_sel == 1: self.state = "channel_edit"; self.full_redraw()
             elif self.profile_sel == 2: self.config.save(); self.state = "chat"; self.full_redraw()
-        elif key == "ESC" or key == "TAB": self.config.save(); self.state = "chat"; self.full_redraw()
+        elif key == "ESC" or key == "TAB":
+            self.config.save(); self.state = "chat"; self.full_redraw()
         return None
 
     def _handle_name_edit(self, key):
@@ -149,8 +181,10 @@ class PagerUI:
         msg = self.input_buf.strip(); self.input_buf = ""; return msg
 
     def add_message(self, sender, text, outgoing=False, msg_id=None):
-        # Dedupe incoming retries: sender resends on ack loss, we must not show it twice.
-        # Outgoing messages don't need dedupe (we only call add_message once on send).
+        # Dedupe incoming retries: sender resends on ack loss, we must not show
+        # the same message twice. Outgoing messages don't need dedupe -- we
+        # only call add_message once per send, and retries go through
+        # check_timeouts -> lora.send which doesn't touch local state.
         if not outgoing and msg_id:
             for m in reversed(self.messages[-20:]):
                 if not m.outgoing and m.msg_id == msg_id:
@@ -169,8 +203,9 @@ class PagerUI:
         return False
 
     def check_timeouts(self):
-        """Retransmit pending messages up to MAX_RETRIES; flip to FAIL when exhausted.
-        Returns True if any message transitioned (so main loop redraws)."""
+        """Retransmit pending messages up to MAX_RETRIES; flip to FAIL when
+        exhausted. Returns True if any message transitioned (so main loop
+        can redraw and trigger the failure beep if needed)."""
         changed = False; now = time.time()
         for m in self.messages:
             if m.status != STATUS_SENDING:
@@ -178,14 +213,18 @@ class PagerUI:
             if (now - m.last_sent_ts) <= ACK_TIMEOUT:
                 continue
             if m.retries < MAX_RETRIES and self.lora is not None and m.msg_id:
-                # Retransmit with the SAME msg_id so receiver can dedupe.
+                # Retransmit with the SAME msg_id so the receiver can dedupe.
+                # If the receiver got the first send but its ack was lost, the
+                # second send is a no-op on their side (dedupe) but they'll
+                # still re-ack because main.py acks every received message.
                 try:
                     self.lora.send(m.sender, m.text, msg_id=m.msg_id)
                 except Exception as e:
                     print(f"retry TX error: {e}")
                 m.retries += 1
                 m.last_sent_ts = now
-                # status stays STATUS_SENDING — caller won't beep_error yet
+                # Status stays STATUS_SENDING; display layer upgrades the
+                # rendering to "~1", "~2" based on m.retries.
                 changed = True
             else:
                 m.status = STATUS_FAIL
@@ -200,8 +239,21 @@ class PagerUI:
         if not self.eink: return
         try:
             if self.state == "chat":
+                # Hand the display layer a generous window of recent messages
+                # (EINK_WINDOW) so its word-wrap has something to work with and
+                # can still fill MAX_MSG_LINES with mostly-short messages. The
+                # display itself shows only the most recent lines that fit.
+                cutoff = len(self.messages) - self.scroll
+                start = max(0, cutoff - EINK_WINDOW)
+                # Never hand an empty slice: if everything is scrolled out,
+                # show at least the earliest message.
+                if cutoff <= 0:
+                    cutoff = 1
+                    start = 0
+                visible = self.messages[start:cutoff]
                 self.eink.draw_chat(self.config.name, self.config.channel,
-                                     self.messages[max(0,len(self.messages)-5-self.scroll):len(self.messages)-self.scroll] if self.scroll else self.messages, self.input_buf, self.lora is not None, self.wifi_on)
+                                    visible, self.input_buf,
+                                    self.lora is not None, self.wifi_on)
             elif self.state == "profile":
                 self.eink.draw_profile(self.config.name, self.config.channel, self.profile_sel)
             elif self.state == "name_edit":
@@ -221,8 +273,13 @@ class PagerUI:
         shown = self.messages[start:end]
         for msg in shown:
             t = relative_time(msg.timestamp)
-            if msg.outgoing: print(f"  [{msg.status}] {msg.sender}: {msg.text}  ({t})")
-            else: print(f"  {msg.sender}: {msg.text}  ({t})")
+            if msg.outgoing:
+                status = msg.status
+                if status == STATUS_SENDING and msg.retries > 0:
+                    status = f"~{msg.retries}"
+                print(f"  [{status}] {msg.sender}: {msg.text}  ({t})")
+            else:
+                print(f"  {msg.sender}: {msg.text}  ({t})")
         for _ in range(8 - len(shown)): print()
         print("-" * 50)
         print(f" > {self.input_buf}_")
