@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.12 — 2026-04-21
+
+### Fixed
+- **Buzzer tone race condition.** Concurrent `asyncio.create_task(beep_*)` calls
+  (e.g. sending + receiving in the same 10 ms tick) used to clobber each
+  other's `hardware_PWM` state, leaving the piezo silent or stuck on.
+  `Buzzer.tone()` now serialises via a lazy `asyncio.Lock`, so overlapping
+  beeps queue cleanly instead of overlapping. Alarm + ack + incoming all
+  chain audibly.
+- **`diagnose.py` missed `power.py`** in the file-presence check — a
+  silently-missing `power.py` on the deployed device would break Alt+W
+  without the diagnostic flagging it. Now included.
+
+### Changed
+- **`display_eink.py` _build_message_lines** cleaned up: dropped the unused
+  `is_continuation` tuple field; rendered rows are now 2-tuples
+  `(line_text, timestamp_or_None)`. Shorter call site, same output.
+- **`deploy.ps1` auto-installs the SSH key on first contact.** Previously
+  you had to run `-Setup` manually before `-All` or suffer a password
+  prompt on every single SSH invocation (dozens per deploy). Now any
+  command (`-All`, `-Restart`, `-Diag`, `-WipeHistory`, ...) transparently
+  installs `~\.ssh\id_kidpager.pub` on a fresh pager (single password
+  prompt per device), then proceeds with zero prompts. Re-running is
+  idempotent: the install is `grep -qxF`-guarded so dupes don't accumulate
+  in `authorized_keys`.
+- **`deploy.ps1` fails fast on missing passwordless sudo.** Added an
+  explicit `sudo -n true` probe after key install. Bad NOPASSWD config
+  used to cause a silent hang on step 2's first `sudo` call. Now prints
+  a copy-pasteable one-liner fix and skips the target.
+- **`deploy.ps1` pre-flight.** Autogenerates `~\.ssh\id_kidpager` if
+  missing (ed25519, no passphrase, `-C kidpager-deploy`). Checks for
+  OpenSSH client on Windows with a clear install-instruction message if
+  absent. Added `-Help` flag.
+- **`deploy.ps1` summary.** Per-target OK/FAIL status and total elapsed
+  seconds at the end; exit 0 only if every target succeeded.
+- **`beep_alarm` tamed.** The wake-from-sleep pattern was a 6-tone rising
+  siren up to 3200 Hz (~1 s). Replaced with 3 short equal beeps at 2 kHz
+  (80 ms each, 120 ms gap, ~600 ms total). Still distinct from
+  `beep_incoming` (two rising beeps) so the user can tell "new while
+  asleep" from "new while awake", without the earlier shriek.
+
 ## v0.11 — 2026-04-21
 
 ### Added

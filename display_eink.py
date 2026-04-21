@@ -118,6 +118,10 @@ def _wrap_msg(prefix, text, font, first_max_w, max_w):
 
 
 def _build_message_lines(messages, font, font_sm, max_w):
+    """Flatten every visible message into a list of (line_text, ts_str) pairs.
+    ts_str is set only on the first line of each message (and only when the
+    line fits in first_line_max so the timestamp doesn't overlap the text).
+    Continuation lines get ts_str=None and a 2-space indent baked in."""
     rendered = []
     for msg in messages:
         ts_str = _relative_time(msg.timestamp)
@@ -133,14 +137,15 @@ def _build_message_lines(messages, font, font_sm, max_w):
 
         first_line_max = max_w - ts_w
         if first_line_max < 40:
-            first_line_max = max_w
-            wrapped = _wrap_msg(prefix, msg.text, font, first_line_max, max_w)
-            rendered.append((wrapped[0], None, False))
+            # Not enough room for a timestamp without clobbering the message;
+            # drop the timestamp and use the full width for text.
+            wrapped = _wrap_msg(prefix, msg.text, font, max_w, max_w)
+            rendered.append((wrapped[0], None))
         else:
             wrapped = _wrap_msg(prefix, msg.text, font, first_line_max, max_w)
-            rendered.append((wrapped[0], ts_str, False))
+            rendered.append((wrapped[0], ts_str))
         for w in wrapped[1:]:
-            rendered.append(("  " + w, None, True))
+            rendered.append(("  " + w, None))
     return rendered
 
 
@@ -204,7 +209,7 @@ class EInkDisplay:
         all_lines = _build_message_lines(messages, FONT, FONT_SM, usable_w)
         visible = all_lines[-MAX_MSG_LINES:]
         y = MSG_TOP
-        for line, ts_str, _indent in visible:
+        for line, ts_str in visible:
             d.text((2, y), line, font=FONT, fill=0)
             if ts_str:
                 ts_x = WIDTH - _text_width(FONT_SM, ts_str) - 2

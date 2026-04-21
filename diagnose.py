@@ -128,7 +128,7 @@ def check_files():
     section("Files")
     code = Path("/home/pi/kidpager")
     for f in ("pins.py", "lora.py", "display_eink.py", "keyboard.py",
-              "buzzer.py", "config.py", "ui.py", "main.py"):
+              "buzzer.py", "config.py", "ui.py", "main.py", "power.py"):
         p = code / f
         check(f"~/kidpager/{f}", "pass" if p.exists() else "fail")
 
