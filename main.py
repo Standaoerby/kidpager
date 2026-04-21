@@ -18,6 +18,14 @@ two-pronged debounce:
 Non-typing events (incoming message, ack received, profile navigation, send)
 bypass debounce and trigger an immediate full_redraw() -- they're rare and
 the user wants to see the result now.
+
+Sleep / screen-saver
+--------------------
+After IDLE_TIMEOUT seconds without *any* activity (key or incoming message),
+the UI enters the "sleep" state and shows a minimal screen saver. Any key
+wakes it back into chat. An incoming message also wakes it, but with a
+louder rising alarm (beep_alarm instead of beep_incoming). Silent mode
+mutes all tones regardless of state.
 """
 import asyncio, os, sys, time
 from config import Config
@@ -28,18 +36,19 @@ from buzzer import Buzzer
 import power
 
 CONFIG = os.path.expanduser("~/.kidpager/config.json")
-FLUSH_INTERVAL = 2.0       # seconds between history flushes to SD card
-TYPING_SETTLE = 0.3        # seconds idle before E-Ink redraws after a keypress
-TYPING_MAX_STALE = 1.5     # seconds max between redraws during continuous typing
-KB_CHECK_INTERVAL = 5      # seconds between keyboard liveness checks
-ACK_CHECK_INTERVAL = 2     # seconds between retry/timeout scans
+FLUSH_INTERVAL = 2.0
+TYPING_SETTLE = 0.3
+TYPING_MAX_STALE = 1.5
+KB_CHECK_INTERVAL = 5
+ACK_CHECK_INTERVAL = 2
+IDLE_TIMEOUT = 300   # 5 minutes -- idle time before entering sleep screen
 
 
 async def main():
     config = Config(CONFIG)
     config.load()
     print(f"=== KidPager ===")
-    print(f"Name: {config.name}\n")
+    print(f"Name: {config.name}  Silent: {config.silent}\n")
 
     kb = KeyboardReader()
     if not kb.find_m4():
@@ -49,36 +58,40 @@ async def main():
     lora_ok = lora.init()
 
     buzzer = Buzzer()
+    # Apply persisted silent preference before the first beep can fire.
+    buzzer.set_silent(config.silent)
 
     ui = PagerUI(config, lora if lora_ok else None)
-    # Reflect real Wi-Fi state on startup (kidpager-power.service soft-blocks it
-    # at boot, but /root/.kidpager is persistent across reboots so state can drift).
     ui.set_wifi(power.wifi_is_enabled())
     print("\nReady! Enter=send Esc=menu Alt+W=wifi\n")
     ui.full_redraw()
 
     last_key = 0
     eink_pending = False
-    last_eink_draw = time.time()   # timestamp of most recent E-Ink submit
+    last_eink_draw = time.time()
     last_kb_check = time.time()
     last_ack_check = time.time()
     last_flush = time.time()
+    # Any user input OR incoming message resets this. When now - last_activity
+    # exceeds IDLE_TIMEOUT in chat state, we drop into the screen saver.
+    last_activity = time.time()
 
     try:
         while True:
             got_key = False
             action = None
 
-            # Drain keyboard queue. Cap at 20 keys per tick so a stuck key
-            # can't starve the rest of the loop.
             for _ in range(20):
                 key = kb.read_key_sync()
                 if key is None: break
                 got_key = True
                 last_key = time.time()
+                last_activity = last_key     # any key = activity
                 a = ui.handle_key(key)
-                if a == "send": action = "send"
-                elif a == "toggle_wifi": action = "toggle_wifi"
+                if   a == "send":            action = "send"
+                elif a == "toggle_wifi":     action = "toggle_wifi"
+                elif a == "silent_changed":  action = "silent_changed"
+                elif a == "wake":            action = "wake"
 
             if action == "send":
                 msg = ui.get_message()
@@ -91,21 +104,31 @@ async def main():
                 eink_pending = False
                 last_eink_draw = time.time()
             elif action == "toggle_wifi":
-                # Distinct audible feedback: "ack" when turning ON (clear success),
-                # "sent" (shorter/lower) when turning OFF.
                 new_state = power.wifi_toggle()
                 ui.set_wifi(new_state)
                 asyncio.create_task(buzzer.beep_ack() if new_state else buzzer.beep_sent())
                 ui.full_redraw()
                 eink_pending = False
                 last_eink_draw = time.time()
+            elif action == "silent_changed":
+                # ui already persisted + redrew the profile menu. We just need
+                # to mirror the new setting into the buzzer so the next beep
+                # respects it.
+                buzzer.set_silent(config.silent)
+                # No beep here -- toggling silent shouldn't make a sound either
+                # way (it would be confusing when turning silent ON).
+                eink_pending = False
+                last_eink_draw = time.time()
+            elif action == "wake":
+                # User hit a key while asleep; ui already transitioned to chat
+                # and redrew. Just record that we're active again and skip the
+                # typing-debounce path.
+                eink_pending = False
+                last_eink_draw = time.time()
             elif got_key:
-                # Lightweight: update the SSH/terminal input line immediately
-                # (cheap) and flag the E-Ink for deferred redraw (expensive).
                 ui.term_input_line()
                 eink_pending = True
 
-            # E-Ink refresh: settle after idle OR cap staleness during typing.
             now = time.time()
             if eink_pending:
                 paused = (now - last_key) > TYPING_SETTLE
@@ -115,7 +138,6 @@ async def main():
                     eink_pending = False
                     last_eink_draw = now
 
-            # Keyboard liveness: periodically reconnect if the BT link died.
             if now - last_kb_check > KB_CHECK_INTERVAL:
                 last_kb_check = now
                 if not kb.is_alive():
@@ -124,29 +146,36 @@ async def main():
                     if kb.fd is not None:
                         print("M4 reconnected!")
 
-            # Inbound radio: always ack, dedupe on msg_id.
             if lora_ok:
                 result = lora.receive()
                 if result:
                     rtype, data = result
                     if rtype == "msg":
                         sender, text, msg_id = data
-                        # Ack even duplicates -- lost-ack recovery depends on it.
+                        # Always ack, even duplicates -- lost-ack recovery needs it.
                         lora.send_ack(msg_id)
                         is_new = ui.add_message(sender, text, outgoing=False, msg_id=msg_id)
                         if is_new:
-                            asyncio.create_task(buzzer.beep_incoming())
+                            last_activity = time.time()
+                            if ui.state == "sleep":
+                                # Wake + louder rising alarm. Buzzer itself
+                                # handles silent-mode muting.
+                                ui.wake()
+                                asyncio.create_task(buzzer.beep_alarm())
+                            else:
+                                asyncio.create_task(buzzer.beep_incoming())
                             ui.full_redraw()
                             last_eink_draw = time.time()
                     elif rtype == "ack":
                         if ui.mark_delivered(data):
                             asyncio.create_task(buzzer.beep_ack())
-                            ui.full_redraw()
-                            last_eink_draw = time.time()
+                            # Skip redraw if asleep -- ack isn't worth waking
+                            # the screen for, and we don't want the sleep
+                            # page repainted with partial refresh.
+                            if ui.state != "sleep":
+                                ui.full_redraw()
+                                last_eink_draw = time.time()
 
-            # Retry / timeout scan. Retransmits silently increment m.retries;
-            # the failure beep only fires when a message actually crosses into
-            # STATUS_FAIL (retries exhausted).
             if now - last_ack_check > ACK_CHECK_INTERVAL:
                 last_ack_check = now
                 before = sum(1 for m in ui.messages if m.status == STATUS_FAIL)
@@ -154,26 +183,32 @@ async def main():
                     after = sum(1 for m in ui.messages if m.status == STATUS_FAIL)
                     if after > before:
                         asyncio.create_task(buzzer.beep_error())
-                    ui.full_redraw()
-                    last_eink_draw = time.time()
+                    # Same idea as above: if asleep, keep the sleep screen.
+                    if ui.state != "sleep":
+                        ui.full_redraw()
+                        last_eink_draw = time.time()
 
             if now - last_flush > FLUSH_INTERVAL:
                 last_flush = now
                 ui.flush_history()
+
+            # Auto-sleep: only from chat state, so we don't clobber a user who
+            # left the profile menu open for 5 minutes.
+            if (ui.state == "chat"
+                    and (now - last_activity) > IDLE_TIMEOUT):
+                ui.enter_sleep()
+                last_eink_draw = time.time()
+                # Reset so we don't re-enter sleep every tick.
+                last_activity = now
 
             await asyncio.sleep(0.01)
 
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        # Any other exception still lands in finally for cleanup,
-        # but we log it so journalctl captures the root cause.
         print(f"FATAL in main loop: {e!r}")
         raise
     finally:
-        # Cleanup runs on Ctrl+C AND on any unexpected exception -- without
-        # this, a mid-loop crash would leave history unflushed and E-Ink BUSY
-        # stuck HIGH, blocking the next boot at LoRa init.
         try: config.save()
         except Exception as e: print(f"config.save error: {e}")
         try: ui.flush_history()
@@ -183,13 +218,14 @@ async def main():
             except Exception as e: print(f"lora.cleanup error: {e}")
         if ui.eink:
             try:
-                ui.eink.cleanup()   # stop worker thread
-                ui.eink.sleep()     # deep-sleep display so BUSY drops LOW for next start
+                ui.eink.cleanup()
+                ui.eink.sleep()
             except Exception as e: print(f"eink cleanup error: {e}")
         try: buzzer.cleanup()
         except Exception as e: print(f"buzzer.cleanup error: {e}")
         try: kb.close()
         except Exception as e: print(f"kb.close error: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

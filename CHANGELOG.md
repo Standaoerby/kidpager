@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.11 — 2026-04-21
+
+### Added
+- **Silent mode** in the profile menu (TAB → Silent: ON/OFF, toggled with
+  ENTER). When on, the buzzer is muted for every event — sent, incoming,
+  ack, error, and the new wake alarm. Persisted in `config.json` so it
+  survives reboots. Header shows an **`M`** badge while muted (next to the
+  existing **`W`** Wi-Fi badge and the LoRa indicator).
+- **Screen saver / sleep state** after `IDLE_TIMEOUT = 300 s` (5 min) of
+  no user input and no incoming messages in `chat` state. Shows a minimal
+  `Zzz` + owner name + hint screen to reduce E-Ink wear. Auto-sleep only
+  triggers from chat, never from the profile menu (so an open menu
+  doesn't disappear on you).
+- **Wake transitions.** Any keypress wakes into chat (the key itself is
+  not consumed — an accidental bump doesn't start typing). An incoming
+  message also wakes, and triggers the new `beep_alarm` (a rising
+  6-tone siren, ~1 s) instead of the short `beep_incoming` — louder
+  because the user isn't looking at the screen. Silent mode mutes the
+  alarm too.
+- **`Buzzer.set_silent(bool)`** — single-flag gate on every tone, so
+  silent-mode enforcement lives entirely in `buzzer.py` and the rest of
+  the codebase doesn't need conditional beep calls.
+
+### Changed
+- **Profile menu is now 4 items** (Name, Channel, Silent, Back). ENTER on
+  Silent toggles in place; ENTER on Back or ESC/TAB saves and returns to
+  chat.
+- **`config.json` gains a `silent` field** (default `false`). Older
+  configs without it load cleanly via `.get()` and get the new field on
+  next save — no migration needed.
+- **Main loop skips E-Ink redraws while asleep** for ack/timeout events.
+  An incoming message is the one thing that wakes the screen; everything
+  else stays on the sleep view to preserve the panel.
+
 ## v0.10 — 2026-04-21
 
 ### Changed

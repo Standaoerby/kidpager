@@ -1,14 +1,12 @@
 """Passive buzzer via hardware PWM on GPIO 13 (pigpio).
 
-Uses the pigpiod daemon for true hardware PWM — it does not generate
+Uses the pigpiod daemon for true hardware PWM -- it does not generate
 software interrupts, so it does not disturb SPI timing for the e-ink
 display during partial refresh.
 
-Setup is handled automatically by deploy.ps1 step [2/7]. On Raspberry Pi
-OS Bookworm the pigpio apt package is no longer available (it does not
-support the RP1 chip on Pi 5), so deploy.ps1 builds joan2937/pigpio from
-source, installs the Python module via pip, drops in a systemd unit, and
-refreshes the dynamic linker cache. See deploy.ps1 for the full recipe.
+Silent mode: set via set_silent(True); every tone() call becomes a no-op.
+The higher-level beep_* methods all go through tone(), so a single flag
+gates every sound the pager can make.
 """
 import asyncio, time
 
@@ -29,6 +27,7 @@ class Buzzer:
     def __init__(self):
         self.pi = None
         self.enabled = False
+        self.silent = False   # flipped by set_silent() from main.py
         if not HAS_PIGPIO:
             return
         try:
@@ -45,9 +44,15 @@ class Buzzer:
             print(f"Buzzer init failed: {e}")
             self.pi = None
 
+    def set_silent(self, on):
+        """Toggle silent mode. Any in-flight tone() will finish; subsequent
+        tone() calls return immediately until set_silent(False)."""
+        self.silent = bool(on)
+
     async def tone(self, freq_hz, duration_ms, duty_pct=50):
-        """Play a single tone non-blockingly. duty_pct: 0-100."""
-        if not self.enabled or self.pi is None:
+        """Play a single tone non-blockingly. duty_pct: 0-100.
+        No-op if silent mode is on or the buzzer is disabled."""
+        if self.silent or not self.enabled or self.pi is None:
             return
         try:
             freq = max(50, int(freq_hz))
@@ -59,24 +64,33 @@ class Buzzer:
             print(f"Buzzer tone error: {e}")
 
     async def beep_incoming(self):
-        """Two short rising beeps — incoming message."""
+        """Two short rising beeps -- incoming message (awake)."""
         await self.tone(1800, 60)
         await asyncio.sleep(0.04)
         await self.tone(2400, 60)
 
     async def beep_sent(self):
-        """One short blip — message sent."""
+        """One short blip -- message sent."""
         await self.tone(2200, 30)
 
     async def beep_ack(self):
-        """One soft confirmation — delivery confirmed."""
+        """One soft confirmation -- delivery confirmed."""
         await self.tone(3000, 25)
 
     async def beep_error(self):
-        """Low descending — send failed / timeout."""
+        """Low descending -- send failed / timeout."""
         await self.tone(800, 80)
         await asyncio.sleep(0.03)
         await self.tone(500, 120)
+
+    async def beep_alarm(self):
+        """Rising siren, ~1 second total -- wake-from-sleep alarm for a new
+        incoming message while the pager is in screen-saver mode. Louder
+        signature than beep_incoming because the user isn't watching the
+        screen. Respects silent mode (each tone() call re-checks)."""
+        for freq in (1200, 1600, 2000, 2400, 2800, 3200):
+            await self.tone(freq, 120)
+            await asyncio.sleep(0.04)
 
     def cleanup(self):
         if self.pi is not None:

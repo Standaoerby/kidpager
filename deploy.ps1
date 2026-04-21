@@ -61,6 +61,31 @@ $sshCmd = @(
     "-o", "LogLevel=ERROR"
 )
 
+# Windows mDNS (Bonjour) is flaky on long-running deploys: the cache can
+# expire or the resolver can stutter mid-deploy, killing steps 6/7/8 with
+# "Could not resolve hostname". Resolve once up front, cache the IP, reuse it
+# for every subsequent SSH invocation against this pager. If the pager moves
+# we just re-run deploy.
+#
+# Uses [IPAddress]::TryParse to pass through already-numeric hosts and
+# [System.Net.Dns]::GetHostAddresses for lookups (which honors the Windows
+# mDNS resolver on Win10+). Retries 5x with 500ms gaps to ride out transient
+# Bonjour hiccups.
+function Resolve-Target {
+    param([string]$HostName)
+    $tmp = $null
+    if ([System.Net.IPAddress]::TryParse($HostName, [ref]$tmp)) { return $HostName }
+    for ($i = 0; $i -lt 5; $i++) {
+        try {
+            $addrs = [System.Net.Dns]::GetHostAddresses($HostName)
+            $ipv4  = $addrs | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+            if ($ipv4) { return $ipv4.IPAddressToString }
+        } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+    return $null
+}
+
 # Production code + diagnose.py (useful in the field).
 $PY_FILES = @("pins.py","lora.py","display_eink.py","config.py","keyboard.py","buzzer.py","ui.py","main.py","power.py","diagnose.py")
 # Developer-only smoke tests; only copied when -Tests is passed.
@@ -73,15 +98,19 @@ $WIPE_CMD = "sudo systemctl stop kidpager 2>/dev/null; sudo rm -f /root/.kidpage
 if ($Setup) {
     if (!(Test-Path $KEY)) { ssh-keygen -t ed25519 -N '""' -f $KEY }
     foreach ($dest in $PAGERS) {
-        Write-Host "Key -> $dest (password once)..." -ForegroundColor Cyan
-        Get-Content "${KEY}.pub" | ssh -F nul -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "${PiUser}@${dest}" "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" 2>$null
+        $ip = Resolve-Target $dest
+        if (-not $ip) { Write-Host "$dest UNREACHABLE (DNS)" -ForegroundColor Red; continue }
+        Write-Host "Key -> $dest ($ip) (password once)..." -ForegroundColor Cyan
+        Get-Content "${KEY}.pub" | ssh -F nul -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "${PiUser}@${ip}" "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys" 2>$null
     }
     Write-Host "Done! Run: .\deploy.ps1 -All" -ForegroundColor Green; exit 0
 }
 
 if ($Restart) {
     foreach ($dest in $PAGERS) {
-        ssh @sshCmd "${PiUser}@${dest}" "sudo systemctl restart kidpager 2>/dev/null && echo $dest OK || echo $dest FAIL" 2>$null
+        $ip = Resolve-Target $dest
+        if (-not $ip) { Write-Host "$dest UNREACHABLE (DNS)" -ForegroundColor Red; continue }
+        ssh @sshCmd "${PiUser}@${ip}" "sudo systemctl restart kidpager 2>/dev/null && echo $dest OK || echo $dest FAIL" 2>$null
     }
     exit 0
 }
@@ -91,8 +120,10 @@ if ($Restart) {
 if ($Diag) {
     $targets = if ($PiHost) { @($PiHost) } else { $PAGERS }
     foreach ($dest in $targets) {
-        Write-Host "`n=== Diag $dest ===" -ForegroundColor Yellow
-        ssh @sshCmd "${PiUser}@${dest}" "cd /home/pi/kidpager && sudo python3 diagnose.py -y" 2>$null
+        $ip = Resolve-Target $dest
+        if (-not $ip) { Write-Host "$dest UNREACHABLE (DNS)" -ForegroundColor Red; continue }
+        Write-Host "`n=== Diag $dest ($ip) ===" -ForegroundColor Yellow
+        ssh @sshCmd "${PiUser}@${ip}" "cd /home/pi/kidpager && sudo python3 diagnose.py -y" 2>$null
     }
     exit 0
 }
@@ -100,8 +131,10 @@ if ($Diag) {
 # Standalone wipe (no deploy)
 if ($WipeHistory -and -not $All -and -not $PiHost) {
     foreach ($dest in $PAGERS) {
+        $ip = Resolve-Target $dest
+        if (-not $ip) { Write-Host "$dest UNREACHABLE (DNS)" -ForegroundColor Red; continue }
         Write-Host "Wipe history -> $dest" -ForegroundColor Magenta
-        ssh @sshCmd "${PiUser}@${dest}" $WIPE_CMD 2>$null
+        ssh @sshCmd "${PiUser}@${ip}" $WIPE_CMD 2>$null
     }
     exit 0
 }
@@ -113,11 +146,17 @@ else { Write-Host "Usage: -Setup | -All | -PiHost name | -Restart | -WipeHistory
 if (!(Test-Path $KEY)) { Write-Host "Run -Setup first" -ForegroundColor Red; exit 1 }
 
 foreach ($dest in $targets) {
-    $t = "${PiUser}@${dest}"
     Write-Host "`n=== $dest ===" -ForegroundColor Yellow
 
+    # Resolve hostname -> IP once. Use the IP for all 8 deploy steps so a
+    # mid-deploy Bonjour hiccup can't drop steps 6/7/8 with a DNS failure.
+    $ip = Resolve-Target $dest
+    if (-not $ip) { Write-Host "  UNREACHABLE (DNS could not resolve $dest)" -ForegroundColor Red; continue }
+    if ($ip -ne $dest) { Write-Host "  $dest -> $ip" -ForegroundColor DarkGray }
+    $t = "${PiUser}@${ip}"
+
     $ok = ssh @sshCmd $t "echo ok" 2>$null
-    if ($ok -ne "ok") { Write-Host "  UNREACHABLE" -ForegroundColor Red; continue }
+    if ($ok -ne "ok") { Write-Host "  UNREACHABLE (SSH)" -ForegroundColor Red; continue }
 
     Write-Host "  [1/8] Packages" -ForegroundColor Cyan
     # python3-pigpio is the Python client library, available on Trixie.
@@ -126,29 +165,33 @@ foreach ($dest in $targets) {
     ssh @sshCmd $t "sudo apt update -qq 2>/dev/null; sudo apt install -y python3-spidev python3-rpi.gpio python3-pil python3-gpiozero python3-pigpio git build-essential bluez fonts-dejavu-core wget rfkill 2>/dev/null | tail -1"
 
     Write-Host "  [2/8] SPI + pigpiod (build daemon from source)" -ForegroundColor Cyan
-    # Trixie Lite has python3-pigpio (client library, installed in [1/8]) but
-    # NOT the pigpiod daemon package -- they dropped it. We build it from
-    # joan2937/pigpio sources.
+    # Trixie Lite is supposed to have python3-pigpio (client library) and we
+    # build pigpiod (C daemon) from source. In practice python3-pigpio
+    # sometimes silently fails to install (network hiccup, apt errors hidden
+    # by 2>/dev/null in [1/8]), and then `import pigpio` fails even though
+    # the daemon is running. Fix: if the Python module is missing, we copy
+    # pigpio.py straight out of the cloned source tree (it's pure Python, no
+    # compile needed) into the system site-packages. Self-heals whatever
+    # combination of pieces is broken.
     #
-    # Idempotent in three pieces:
-    #   1. binary -- skip build if /usr/local/bin/pigpiod already exists
-    #   2. unit   -- write only if missing
-    #   3. start  -- enable --now on every run (cheap if already running)
-    #
-    # Re-running this step on a half-broken install fixes whichever piece is
-    # missing without clobbering the rest.
+    # Idempotent:
+    #   1. pigpiod binary  -- skip build if /usr/local/bin/pigpiod exists
+    #   2. pigpio.py       -- fix only if `import pigpio` fails
+    #   3. systemd unit    -- write only if missing
+    #   4. start           -- enable --now every run (cheap if already active)
     ssh @sshCmd $t @"
 set -e
 sudo raspi-config nonint do_spi 0 2>/dev/null || true
 
+# --- (1) pigpiod C daemon -------------------------------------------------
 if [ ! -x /usr/local/bin/pigpiod ]; then
     echo '  Building pigpio from source (2-3 minutes, be patient)...'
     cd /tmp && rm -rf pigpio
     git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1
     cd pigpio && make -j4 >/dev/null 2>&1
     # We only need the C library + daemon binary. The Makefile's Python-module
-    # install step fails on Py3.12+ (distutils removed); irrelevant here
-    # because python3-pigpio is already installed from apt. Swallow the error.
+    # install step fails on Py3.12+ (distutils removed); we handle Python
+    # bindings separately below.
     sudo make install 2>/dev/null || true
     sudo ldconfig
     echo '  pigpiod built and installed'
@@ -156,6 +199,26 @@ else
     echo '  pigpiod daemon already installed'
 fi
 
+# --- (2) pigpio Python client --------------------------------------------
+# Try apt path first, then fall back to copying pigpio.py from source.
+# `python3 -c 'import pigpio'` is the source of truth: if it succeeds we
+# don't care where the file came from.
+if ! python3 -c 'import pigpio' 2>/dev/null; then
+    echo '  pigpio Python module missing, self-healing...'
+    # Fallback: snag pigpio.py straight out of the source tree. It's a pure
+    # Python socket client; no compile, no setup.py needed.
+    if [ ! -f /tmp/pigpio/pigpio.py ]; then
+        cd /tmp && rm -rf pigpio
+        git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1
+    fi
+    DEST=`$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)
+    [ -z "`$DEST" ] && DEST=/usr/local/lib/python3/dist-packages
+    sudo mkdir -p "`$DEST"
+    sudo cp /tmp/pigpio/pigpio.py "`$DEST/pigpio.py"
+    echo "  pigpio.py copied to `$DEST"
+fi
+
+# --- (3) systemd unit ----------------------------------------------------
 if [ ! -f /lib/systemd/system/pigpiod.service ]; then
     sudo tee /lib/systemd/system/pigpiod.service >/dev/null <<'UNIT'
 [Unit]
@@ -172,12 +235,13 @@ UNIT
     echo '  pigpiod.service unit installed'
 fi
 
+# --- (4) start + verify --------------------------------------------------
 sudo systemctl daemon-reload
 sudo systemctl enable pigpiod --now 2>/dev/null
 sleep 1
 systemctl is-active pigpiod 2>/dev/null | grep -q active && echo '  pigpiod: active' || echo '  pigpiod: FAILED'
-# Verify the client can actually reach the socket -- catches a race where the
-# daemon is "active" but not yet listening, plus catches a missing binding.
+# Verify the client can reach the socket. Catches a race where the daemon
+# is "active" but not yet listening, plus catches a missing binding.
 python3 -c 'import pigpio; p=pigpio.pi(); print("  pigpio socket: OK" if p.connected else "  pigpio socket: UNREACHABLE"); (p.stop() if p.connected else None)' 2>/dev/null || echo '  pigpio module: IMPORT FAILED'
 "@
 
@@ -218,8 +282,9 @@ python3 -c 'import pigpio; p=pigpio.pi(); print("  pigpio socket: OK" if p.conne
     # Remove stale /home/pi/.kidpager/config.json from pre-v0.9 deploys; live
     # config lives in /root/.kidpager/ because the service runs as root.
     # Existing /root/.kidpager/config.json is NEVER overwritten (guarded by
-    # `test -f`) -- preserves the user's name and channel across redeploys.
-    ssh @sshCmd $t "sudo rm -f /home/pi/.kidpager/config.json; sudo mkdir -p /root/.kidpager; sudo test -f /root/.kidpager/config.json || echo '{""name"":""Kid"",""channel"":1}' | sudo tee /root/.kidpager/config.json >/dev/null"
+    # `test -f`) -- preserves the user's name, channel, and silent flag
+    # across redeploys.
+    ssh @sshCmd $t "sudo rm -f /home/pi/.kidpager/config.json; sudo mkdir -p /root/.kidpager; sudo test -f /root/.kidpager/config.json || echo '{""name"":""Kid"",""channel"":1,""silent"":false}' | sudo tee /root/.kidpager/config.json >/dev/null"
 
     Write-Host "  [6/8] Service" -ForegroundColor Cyan
     ssh @sshCmd $t "sudo bash -c 'cat > /etc/systemd/system/kidpager.service << SVCEOF

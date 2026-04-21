@@ -10,6 +10,14 @@ With defaults = 3 * 4 + 2 = 14 s.
 
 While a message is being retransmitted, its status stays STATUS_SENDING (`~`)
 but the UI shows `~1`, `~2`, ... so the user can see the attempt count.
+
+States:
+  "chat"         -- main view: messages + input line
+  "profile"      -- TAB/ESC menu: Name / Channel / Silent / Back
+  "name_edit"    -- text edit for name
+  "channel_edit" -- number picker for channel
+  "sleep"        -- screen saver after IDLE_TIMEOUT seconds of inactivity.
+                    Any key or incoming message returns to "chat".
 """
 import time, sys, json, os
 
@@ -25,17 +33,12 @@ STATUS_SENDING = "~"
 STATUS_OK = "+"
 STATUS_FAIL = "x"
 
-ACK_TIMEOUT = 4        # seconds per attempt (send + ack round-trip)
-MAX_RETRIES = 2        # retransmit count; total attempts = 1 + MAX_RETRIES
-CHECK_INTERVAL = 2     # seconds between check_timeouts() calls (informational;
-                       # main.py enforces the cadence)
+ACK_TIMEOUT = 4
+MAX_RETRIES = 2
+CHECK_INTERVAL = 2
 
 HISTORY_FILE = os.path.expanduser("~/.kidpager/history.json")
 MAX_HISTORY = 100
-
-# How many past messages we hand to the display layer. More than fits on-screen,
-# so the display can word-wrap and still show the latest MAX_MSG_LINES lines
-# even when recent messages span multiple visual lines each.
 EINK_WINDOW = 30
 
 
@@ -54,10 +57,9 @@ class Message:
         self.text = text
         self.outgoing = outgoing
         self.msg_id = msg_id
-        # `timestamp or time.time()` was buggy: a loaded timestamp of 0 falsy-ed into "now".
         self.timestamp = time.time() if timestamp is None else timestamp
-        self.retries = 0                      # in-memory only; incremented by check_timeouts
-        self.last_sent_ts = self.timestamp    # when the most recent TX attempt went out
+        self.retries = 0
+        self.last_sent_ts = self.timestamp
         if status:
             self.status = status
         else:
@@ -74,16 +76,25 @@ class Message:
 
 
 class PagerUI:
+    # Profile menu item indices. Kept as constants so main.py or tests can
+    # reference them by name rather than by integer.
+    PROF_NAME = 0
+    PROF_CHANNEL = 1
+    PROF_SILENT = 2
+    PROF_BACK = 3
+    PROF_COUNT = 4
+
     def __init__(self, config, lora=None):
         self.config = config
         self.lora = lora
         self.messages = []
         self.input_buf = ""
-        self.state = "chat"; self.scroll = 0
+        self.state = "chat"
+        self.scroll = 0
         self.profile_sel = 0
         self.eink = None
-        self.wifi_on = False   # set by main.py from power.wifi_is_enabled()
-        self._dirty = False    # history needs flushing to disk
+        self.wifi_on = False
+        self._dirty = False
         self._load_history()
         if HAS_EINK:
             try:
@@ -91,6 +102,7 @@ class PagerUI:
             except Exception as e:
                 print(f"E-Ink init failed: {e}")
 
+    # ---------- history ----------
     def _load_history(self):
         try:
             with open(HISTORY_FILE) as f:
@@ -98,8 +110,6 @@ class PagerUI:
                 self.messages = [Message.from_dict(d) for d in data[-MAX_HISTORY:]]
                 for m in self.messages:
                     if m.status == STATUS_SENDING:
-                        # In-flight retries don't survive a restart: flip to FAIL
-                        # so the user can see what didn't get through.
                         m.status = STATUS_FAIL
                         self._dirty = True
                 print(f"Loaded {len(self.messages)} messages")
@@ -107,8 +117,6 @@ class PagerUI:
             self.messages = []
 
     def flush_history(self):
-        """Write history to disk only if something changed since last flush.
-        Called periodically from the main loop to avoid SD-card write amplification."""
         if not self._dirty:
             return
         try:
@@ -119,18 +127,21 @@ class PagerUI:
         except Exception as e:
             print(f"History save error: {e}")
 
+    # ---------- key dispatch ----------
     def handle_key(self, key):
         # Alt+W is global: toggles Wi-Fi from any screen, doesn't consume input.
         if key == "WIFI":
             return "toggle_wifi"
-        if self.state == "chat": return self._handle_chat(key)
-        elif self.state == "profile": return self._handle_profile(key)
-        elif self.state == "name_edit": return self._handle_name_edit(key)
+        # Sleep state takes precedence: any key wakes into chat and is consumed.
+        if self.state == "sleep":
+            return self._handle_sleep(key)
+        if self.state == "chat":           return self._handle_chat(key)
+        elif self.state == "profile":      return self._handle_profile(key)
+        elif self.state == "name_edit":    return self._handle_name_edit(key)
         elif self.state == "channel_edit": return self._handle_channel_edit(key)
         return None
 
     def set_wifi(self, on):
-        """Called from main.py after power.wifi_toggle(); updates the header badge."""
         self.wifi_on = bool(on)
 
     def _handle_chat(self, key):
@@ -139,9 +150,6 @@ class PagerUI:
         elif key == "ESC" or key == "TAB":
             self.state = "profile"; self.profile_sel = 0; self.full_redraw()
         elif key == "UP":
-            # Scroll bound: messages may be multi-line, so we can't assume
-            # "show exactly 5 at a time". Allow scroll up to len(messages)-1
-            # so the user can reach the very first message if they want.
             self.scroll = min(self.scroll + 1, max(0, len(self.messages) - 1))
             self.full_redraw()
         elif key == "DOWN":
@@ -152,12 +160,23 @@ class PagerUI:
         return None
 
     def _handle_profile(self, key):
-        if key == "UP": self.profile_sel = max(0, self.profile_sel - 1); self.full_redraw()
-        elif key == "DOWN": self.profile_sel = min(2, self.profile_sel + 1); self.full_redraw()
+        if key == "UP":
+            self.profile_sel = max(0, self.profile_sel - 1); self.full_redraw()
+        elif key == "DOWN":
+            self.profile_sel = min(self.PROF_COUNT - 1, self.profile_sel + 1); self.full_redraw()
         elif key == "ENTER":
-            if self.profile_sel == 0: self.state = "name_edit"; self.full_redraw()
-            elif self.profile_sel == 1: self.state = "channel_edit"; self.full_redraw()
-            elif self.profile_sel == 2: self.config.save(); self.state = "chat"; self.full_redraw()
+            if self.profile_sel == self.PROF_NAME:
+                self.state = "name_edit"; self.full_redraw()
+            elif self.profile_sel == self.PROF_CHANNEL:
+                self.state = "channel_edit"; self.full_redraw()
+            elif self.profile_sel == self.PROF_SILENT:
+                # Toggle in place, no sub-screen. Persist so it survives reboot.
+                self.config.silent = not self.config.silent
+                self.config.save()
+                self.full_redraw()
+                return "silent_changed"
+            elif self.profile_sel == self.PROF_BACK:
+                self.config.save(); self.state = "chat"; self.full_redraw()
         elif key == "ESC" or key == "TAB":
             self.config.save(); self.state = "chat"; self.full_redraw()
         return None
@@ -170,21 +189,41 @@ class PagerUI:
         return None
 
     def _handle_channel_edit(self, key):
-        # Channel 1..99. UP/RIGHT +1, DOWN/LEFT -1, ENTER saves + back to profile.
         if key == "ENTER": self.config.save(); self.state = "profile"; self.full_redraw()
         elif key in ("UP", "RIGHT"): self.config.channel = min(99, self.config.channel + 1); self.full_redraw()
         elif key in ("DOWN", "LEFT"): self.config.channel = max(1, self.config.channel - 1); self.full_redraw()
         elif key == "ESC" or key == "TAB": self.state = "profile"; self.full_redraw()
         return None
 
+    def _handle_sleep(self, key):
+        """Any keypress wakes into chat. The key itself is NOT consumed as
+        input (so an accidental bump doesn't start typing). Returns 'wake' so
+        main.py knows to update last_activity and skip further beep logic."""
+        self.state = "chat"
+        self.full_redraw()
+        return "wake"
+
+    # ---------- sleep transitions (called from main.py) ----------
+    def enter_sleep(self):
+        """Switch to the screen-saver view. Called by main.py when the user
+        has been idle for longer than IDLE_TIMEOUT. Safe to call from any
+        state: just renders the sleep screen; wake-up restores chat."""
+        if self.state != "sleep":
+            self.state = "sleep"
+            self.full_redraw()
+
+    def wake(self):
+        """Transition from sleep back to chat. Used by main.py on incoming
+        messages -- main.py is responsible for calling full_redraw() after
+        so the new message is drawn immediately."""
+        if self.state == "sleep":
+            self.state = "chat"
+
+    # ---------- messages ----------
     def get_message(self):
         msg = self.input_buf.strip(); self.input_buf = ""; return msg
 
     def add_message(self, sender, text, outgoing=False, msg_id=None):
-        # Dedupe incoming retries: sender resends on ack loss, we must not show
-        # the same message twice. Outgoing messages don't need dedupe -- we
-        # only call add_message once per send, and retries go through
-        # check_timeouts -> lora.send which doesn't touch local state.
         if not outgoing and msg_id:
             for m in reversed(self.messages[-20:]):
                 if not m.outgoing and m.msg_id == msg_id:
@@ -203,9 +242,6 @@ class PagerUI:
         return False
 
     def check_timeouts(self):
-        """Retransmit pending messages up to MAX_RETRIES; flip to FAIL when
-        exhausted. Returns True if any message transitioned (so main loop
-        can redraw and trigger the failure beep if needed)."""
         changed = False; now = time.time()
         for m in self.messages:
             if m.status != STATUS_SENDING:
@@ -213,18 +249,12 @@ class PagerUI:
             if (now - m.last_sent_ts) <= ACK_TIMEOUT:
                 continue
             if m.retries < MAX_RETRIES and self.lora is not None and m.msg_id:
-                # Retransmit with the SAME msg_id so the receiver can dedupe.
-                # If the receiver got the first send but its ack was lost, the
-                # second send is a no-op on their side (dedupe) but they'll
-                # still re-ack because main.py acks every received message.
                 try:
                     self.lora.send(m.sender, m.text, msg_id=m.msg_id)
                 except Exception as e:
                     print(f"retry TX error: {e}")
                 m.retries += 1
                 m.last_sent_ts = now
-                # Status stays STATUS_SENDING; display layer upgrades the
-                # rendering to "~1", "~2" based on m.retries.
                 changed = True
             else:
                 m.status = STATUS_FAIL
@@ -233,40 +263,40 @@ class PagerUI:
             self._dirty = True
         return changed
 
+    # ---------- rendering ----------
     def full_redraw(self): self._term_redraw(); self.eink_refresh()
 
     def eink_refresh(self):
         if not self.eink: return
         try:
             if self.state == "chat":
-                # Hand the display layer a generous window of recent messages
-                # (EINK_WINDOW) so its word-wrap has something to work with and
-                # can still fill MAX_MSG_LINES with mostly-short messages. The
-                # display itself shows only the most recent lines that fit.
                 cutoff = len(self.messages) - self.scroll
                 start = max(0, cutoff - EINK_WINDOW)
-                # Never hand an empty slice: if everything is scrolled out,
-                # show at least the earliest message.
                 if cutoff <= 0:
-                    cutoff = 1
-                    start = 0
+                    cutoff = 1; start = 0
                 visible = self.messages[start:cutoff]
                 self.eink.draw_chat(self.config.name, self.config.channel,
                                     visible, self.input_buf,
-                                    self.lora is not None, self.wifi_on)
+                                    self.lora is not None, self.wifi_on,
+                                    self.config.silent)
             elif self.state == "profile":
-                self.eink.draw_profile(self.config.name, self.config.channel, self.profile_sel)
+                self.eink.draw_profile(self.config.name, self.config.channel,
+                                       self.config.silent, self.profile_sel)
             elif self.state == "name_edit":
                 self.eink.draw_name_edit(self.config.name)
             elif self.state == "channel_edit":
                 self.eink.draw_channel_edit(self.config.channel)
+            elif self.state == "sleep":
+                self.eink.draw_sleep(self.config.name, self.config.silent)
         except Exception as e:
             print(f"E-Ink error: {e}")
 
     def _term_redraw(self):
         lora = "LoRa:ON" if self.lora else "LoRa:OFF"
         wifi = "  WiFi:ON" if self.wifi_on else ""
-        print(f"\033[2J\033[H KidPager [{self.config.name}]  {lora}{wifi}")
+        mute = "  MUTE"   if self.config.silent else ""
+        sleep_tag = "  [SLEEP]" if self.state == "sleep" else ""
+        print(f"\033[2J\033[H KidPager [{self.config.name}]  {lora}{wifi}{mute}{sleep_tag}")
         print("-" * 50)
         end = len(self.messages) - self.scroll
         start = max(0, end - 8)

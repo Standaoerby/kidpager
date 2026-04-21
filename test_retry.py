@@ -28,6 +28,7 @@ class _FakeEink:
     def draw_profile(self, *a, **k): pass
     def draw_name_edit(self, *a, **k): pass
     def draw_channel_edit(self, *a, **k): pass
+    def draw_sleep(self, *a, **k): pass
     def cleanup(self): pass
     def sleep(self): pass
 
@@ -63,6 +64,7 @@ class FakeConfig:
     def __init__(self):
         self.name = "TestA"
         self.channel = 1
+        self.silent = False
     def save(self): pass
     def load(self): pass
 
