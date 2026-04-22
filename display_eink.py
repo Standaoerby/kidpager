@@ -74,20 +74,38 @@ _STATUS_SENDING = "~"
 # 35 chars fit across 250 px minus margins.
 
 def _load_font(paths, size):
-    """Try each path in order, return the first one that loads. If
-    none load, return Pillow's default bitmap font."""
+    """Try each path in order, return the first truetype that loads,
+    or ``None`` if nothing in the list worked. Caller is responsible
+    for chaining to a lower-priority fallback.
+
+    Previous versions of this function returned ``ImageFont.load_default()``
+    on failure, and the caller checked ``isinstance(FONT, ImageFont.ImageFont)``
+    to decide whether to try a secondary path. That check was broken in
+    both directions depending on the Pillow version:
+
+      * Pillow < 10: ``FreeTypeFont`` was a subclass of ``ImageFont`` so
+        the check was ALWAYS True -- even a successfully loaded Terminus
+        got discarded in favour of DejaVu.
+      * Pillow >= 10 (our Trixie target): ``FreeTypeFont`` is NOT a
+        subclass so the check is ALWAYS False -- the DejaVu fallback
+        never fires, so a missing Terminus drops to Pillow's bundled
+        Aileron at BMP size rather than DejaVu at 12 px.
+
+    Returning ``None`` on failure makes the caller's fallback chain
+    explicit (``or``) and is correct across all Pillow versions.
+    """
     for p in paths:
         if os.path.exists(p):
             try:
                 return ImageFont.truetype(p, size)
             except Exception:
                 continue
-    return ImageFont.load_default()
+    return None
 
 
 # Terminus body font for message text + input line. Try multiple names
 # because packaging differs across distros: fonts-terminus-otb (Debian
-# Bookworm), xfonts-terminus (older), Terminus on Arch, etc.
+# Bookworm / Trixie), xfonts-terminus (older), Terminus on Arch, etc.
 _TERMINUS_CANDIDATES = [
     "/usr/share/fonts/X11/misc/ter-u14n.otb",   # Debian fonts-terminus-otb
     "/usr/share/fonts/X11/misc/ter-u16n.otb",
@@ -97,24 +115,27 @@ _TERMINUS_CANDIDATES = [
 _DEJAVU_SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 _DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
+# Final-fallback: Pillow's bundled default. Never fails. Used only if
+# neither the primary font nor DejaVu exist (should never happen on a
+# correctly deployed pager, but keeps rendering working for unit tests).
+_DEFAULT = ImageFont.load_default()
+
 # Body font for messages + input line. 14 px Terminus ~= 7 px per cell
 # so ~35 cols fit in (WIDTH - 4) px. Falls back to DejaVu 12 if
-# Terminus is absent.
-FONT = _load_font(_TERMINUS_CANDIDATES, 14)
-if isinstance(FONT, ImageFont.ImageFont):
-    # load_default() returns a bitmap; means Terminus failed AND
-    # truetype fallback didn't trigger. Try DejaVu explicitly at 12.
-    FONT = _load_font([_DEJAVU_SANS], 12)
+# Terminus is absent, then to Pillow's bundled default.
+FONT = (_load_font(_TERMINUS_CANDIDATES, 14)
+        or _load_font([_DEJAVU_SANS], 12)
+        or _DEFAULT)
 
 # Small font: 10 px for header badges and timestamps. Always DejaVu
 # because Terminus at 10 px is too pixelated for the tiny badges.
-FONT_SM = _load_font([_DEJAVU_SANS], 10)
+FONT_SM = _load_font([_DEJAVU_SANS], 10) or _DEFAULT
 
 # Bold for header. DejaVu Bold looks better for the owner name.
-FONT_BD = _load_font([_DEJAVU_BOLD], 12)
+FONT_BD = _load_font([_DEJAVU_BOLD], 12) or _DEFAULT
 
 # Big bold for the sleep screen Zzz glyph.
-FONT_BIG = _load_font([_DEJAVU_BOLD], 36)
+FONT_BIG = _load_font([_DEJAVU_BOLD], 36) or _DEFAULT
 
 
 def _relative_time(ts):
@@ -247,9 +268,15 @@ class EInkDisplay:
         self._thread = threading.Thread(target=self._worker, daemon=True, name="eink-worker")
         self._thread.start()
         # Log which body font we ended up with so journalctl shows
-        # whether Terminus was found or we fell back.
-        font_name = getattr(FONT, "path", "<bitmap default>")
-        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker) font={os.path.basename(str(font_name))}")
+        # whether Terminus was found or we fell back. FreeTypeFont.path
+        # is either a string (loaded from disk) or a BytesIO (bundled
+        # default); handle both.
+        fp = getattr(FONT, "path", None)
+        if isinstance(fp, str):
+            font_label = os.path.basename(fp)
+        else:
+            font_label = "<pillow bundled default>"
+        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker) font={font_label}")
 
     def draw_chat(self, name, channel, messages, input_text,
                   lora_on=False, wifi_on=False, silent=False,

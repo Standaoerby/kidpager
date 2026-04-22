@@ -116,21 +116,86 @@ and prints the fix command.
 "@
 }
 
-# Resolve mDNS hostname to IPv4 once; reuse for all subsequent SSH calls so a
-# mid-deploy Bonjour hiccup can't kill steps 6/7/8 with "Could not resolve".
-# Pass-through numeric IPs. 5x retry with 500ms gaps.
+# Resolve an mDNS / LAN hostname to an IPv4 address.
+#
+# Windows .local resolution is famously flaky. Different Windows versions
+# route "*.local" through different resolvers: Bonjour (if iTunes/Printer
+# drivers are installed), native mDNS (Win10 1803+ / Win11), LLMNR, or
+# plain DNS if the router answers for .local (most don't). Any one of
+# those can return no-answer for reasons unrelated to the target being
+# offline. We cascade through 4 methods and return the first IPv4 we get;
+# only if everything fails do we declare UNREACHABLE.
+#
+# Pass-through for numeric IPs: `-PiHost 192.168.68.64` bypasses mDNS
+# entirely, which is the standard workaround when Bonjour croaks.
 function Resolve-Target {
     param([string]$HostName)
+
+    # Method 0: numeric IPv4 pass-through
     $tmp = $null
-    if ([System.Net.IPAddress]::TryParse($HostName, [ref]$tmp)) { return $HostName }
-    for ($i = 0; $i -lt 5; $i++) {
+    if ([System.Net.IPAddress]::TryParse($HostName, [ref]$tmp)) {
+        return $HostName
+    }
+
+    # Method 1: .NET DNS. Uses the Windows system stack, which on a
+    # correctly-configured machine picks up Bonjour, LLMNR, or native
+    # mDNS. 3 attempts at 300 ms -- a fresh SD-flash often takes ~1 s
+    # for the new MAC to propagate the multicast answer.
+    for ($i = 0; $i -lt 3; $i++) {
         try {
             $addrs = [System.Net.Dns]::GetHostAddresses($HostName)
-            $ipv4  = $addrs | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+            $ipv4 = $addrs | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
             if ($ipv4) { return $ipv4.IPAddressToString }
         } catch {}
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 300
     }
+
+    # Method 2: PowerShell Resolve-DnsName with LLMNR fallback. Win11
+    # built-in and survives a stopped Bonjour service, which is the
+    # single most common cause of "worked yesterday, broken today".
+    try {
+        $r = Resolve-DnsName -Name $HostName -Type A -LlmnrFallback `
+                             -QuickTimeout -DnsOnly:$false `
+                             -ErrorAction Stop 2>$null
+        $a = $r | Where-Object { $_.Type -eq 'A' -and $_.IPAddress } | Select-Object -First 1
+        if ($a) { return $a.IPAddress }
+    } catch {}
+
+    # Method 3: ping -4. On Win10 1803+ / Win11 this triggers the native
+    # mDNS resolver even when GetHostAddresses didn't. Parse the IP from
+    # the first "Reply from X.X.X.X: ..." line. -n 1 -w 1000 for fast
+    # fail if the target really is down.
+    try {
+        $pingOut = & ping -4 -n 1 -w 1000 $HostName 2>$null
+        $m = $pingOut | Select-String -Pattern '(\d+\.\d+\.\d+\.\d+)' | Select-Object -First 1
+        if ($m) {
+            $ip = $m.Matches[0].Groups[1].Value
+            # Filter out 0.0.0.0 / multicast / broadcast so a ping-back
+            # from an unexpected interface doesn't poison the result.
+            if ($ip -ne '0.0.0.0' -and $ip -notmatch '^(224|239|255)\.') {
+                return $ip
+            }
+        }
+    } catch {}
+
+    # Method 4: ARP cache scan. If the pager answered ANY broadcast in
+    # the last few minutes (DHCP, mDNS, NetBIOS, SSDP), its MAC+IP is
+    # in the Windows ARP table. We grep for Raspberry Pi Foundation
+    # MAC prefixes. This is best-effort: if >1 Pi is on the LAN we
+    # can't tell which one is $HostName, so we return the first match
+    # and trust the caller to verify via the subsequent SSH probe.
+    try {
+        $pi_prefixes = @('d8-3a-dd', 'b8-27-eb', 'dc-a6-32', '28-cd-c1', 'e4-5f-01')
+        $arpOut = & arp -a 2>$null
+        foreach ($line in $arpOut) {
+            foreach ($p in $pi_prefixes) {
+                if ($line -match "(\d+\.\d+\.\d+\.\d+)\s+$p") {
+                    return $matches[1]
+                }
+            }
+        }
+    } catch {}
+
     return $null
 }
 
@@ -334,15 +399,25 @@ foreach ($dest in $targets) {
     #     "love" letter-merging bug). Try otb first, then xfonts-terminus.
     #     If both are unavailable, display_eink.py falls back to DejaVu at
     #     runtime so the pager still works, just with v0.13 rendering.
+    #   * avahi-daemon: mDNS publisher so kidpager.local / kidpager2.local
+    #     resolve from Windows. Trixie Lite ships without it by default; a
+    #     first-deploy-by-IP is what bootstraps subsequent deploy-by-name.
     #   * git + build-essential: needed to build pigpiod from source in [2/8]
     #     (not packaged on Raspberry Pi OS Trixie Lite).
+    #
+    # NOTE: bash here-string uses ONLY single-quotes around literal strings.
+    # PowerShell 5.1 silently strips nested double-quotes when passing a
+    # here-string as an argument to a native exe, so `echo "foo (bar)"`
+    # becomes `echo foo (bar)` on the wire and bash errors on the `(`.
+    # Single-quoted strings inside an outer @'...'@ here-string pass through
+    # intact because PS doesn't treat internal `'` as a delimiter.
     ssh @sshCmd $t @'
 sudo apt update -qq 2>/dev/null
 sudo DEBIAN_FRONTEND=noninteractive apt install -y \
     python3-spidev python3-rpi.gpio python3-pil python3-gpiozero \
     python3-pigpio python3-pip \
     git build-essential bluez \
-    fonts-dejavu-core \
+    fonts-dejavu-core avahi-daemon \
     wget rfkill 2>&1 | tail -1
 
 # Terminus bitmap font (for v0.14+ UI). Prefer otb (Debian Trixie/Bookworm),
@@ -350,14 +425,14 @@ sudo DEBIAN_FRONTEND=noninteractive apt install -y \
 # display driver falls back to DejaVu automatically.
 if ! dpkg -s fonts-terminus-otb >/dev/null 2>&1 && ! dpkg -s xfonts-terminus >/dev/null 2>&1; then
     if sudo DEBIAN_FRONTEND=noninteractive apt install -y fonts-terminus-otb 2>/dev/null; then
-        echo "  Terminus: fonts-terminus-otb installed"
+        echo '  Terminus: fonts-terminus-otb installed'
     elif sudo DEBIAN_FRONTEND=noninteractive apt install -y xfonts-terminus 2>/dev/null; then
-        echo "  Terminus: xfonts-terminus installed (fallback)"
+        echo '  Terminus: xfonts-terminus installed - fallback'
     else
-        echo "  Terminus: UNAVAILABLE -- display will use DejaVu fallback"
+        echo '  Terminus: UNAVAILABLE - display will use DejaVu fallback'
     fi
 else
-    echo "  Terminus: already installed"
+    echo '  Terminus: already installed'
 fi
 '@
 
@@ -379,6 +454,12 @@ fi
     # NOTE: we deliberately DON'T use `set -e` here -- each step must be
     # allowed to fail so the next strategy gets a chance. Every failure is
     # logged, nothing is silently swallowed.
+    #
+    # NOTE: all literal strings are single-quoted (see [1/8] for why). Python
+    # one-liners use `python3 -c '...'` or heredoc `python3 <<'PYEOF'` so no
+    # bash `"` ever gets eaten by PowerShell. Bash variable references are
+    # bare `$DEST` (paths on this system have no spaces so we lose nothing
+    # by dropping the "$DEST" quoting).
     ssh @sshCmd $t @'
 sudo raspi-config nonint do_spi 0 2>/dev/null || true
 
@@ -389,17 +470,18 @@ if [ ! -x /usr/local/bin/pigpiod ] && [ ! -x /usr/bin/pigpiod ]; then
     if git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1; then
         cd pigpio
         make -j4 >/dev/null 2>&1
-        # Only need the C library + daemon binary. The Makefile's Python
-        # install step fails on Py3.12+ (distutils removed); (2) handles that.
+        # Only need the C library + daemon binary. The Makefile Python
+        # install step fails on Py3.12+ because distutils was removed;
+        # strategy (2) below installs the Python client directly.
         sudo make install 2>/dev/null
         sudo ldconfig
         if [ -x /usr/local/bin/pigpiod ]; then
             echo '  pigpiod built and installed'
         else
-            echo '  pigpiod build FAILED (check network / make output)'
+            echo '  pigpiod build FAILED - check network / make output'
         fi
     else
-        echo '  pigpiod build FAILED: git clone error'
+        echo '  pigpiod build FAILED - git clone error'
     fi
 else
     echo '  pigpiod daemon already installed'
@@ -423,25 +505,25 @@ else
         if python3 -c 'import pigpio' 2>/dev/null; then
             echo '    [B] OK: pip install worked'
         else
-            # Strategy C: copy pigpio.py out of the github source tree
+            # Strategy C: copy pigpio.py directly from the github source tree
             echo '    [C] copy pigpio.py from github source'
             if [ ! -f /tmp/pigpio/pigpio.py ]; then
                 cd /tmp && rm -rf pigpio
                 git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1
             fi
             if [ -f /tmp/pigpio/pigpio.py ]; then
-                DEST=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null)
-                [ -z "$DEST" ] && DEST=/usr/local/lib/python3/dist-packages
-                sudo mkdir -p "$DEST"
-                sudo cp /tmp/pigpio/pigpio.py "$DEST/pigpio.py"
+                DEST=$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)
+                DEST=${DEST:-/usr/local/lib/python3/dist-packages}
+                sudo mkdir -p $DEST
+                sudo cp /tmp/pigpio/pigpio.py $DEST/pigpio.py
                 if python3 -c 'import pigpio' 2>/dev/null; then
-                    echo "    [C] OK: pigpio.py copied to $DEST"
+                    printf '    [C] OK: pigpio.py copied to %s\n' $DEST
                 else
-                    echo "    [C] FAIL: copied but import still errors"
+                    echo '    [C] FAIL: copied but import still errors'
                     python3 -c 'import pigpio' 2>&1 | head -3 | sed 's/^/        /'
                 fi
             else
-                echo '    [C] FAIL: no pigpio.py in github clone (network?)'
+                echo '    [C] FAIL: no pigpio.py in github clone - network?'
             fi
         fi
     fi
@@ -476,13 +558,23 @@ else
     sudo systemctl status pigpiod --no-pager -n 5 2>/dev/null | head -10 | sed 's/^/    /'
 fi
 
-# Final end-to-end check: Python module AND socket reachable.
-if python3 -c "import pigpio; p=pigpio.pi(); print('  pigpio end-to-end: OK' if p.connected else '  pigpio end-to-end: socket UNREACHABLE (daemon not listening?)'); (p.stop() if p.connected else None)" 2>&1; then
-    :
-else
-    echo '  pigpio end-to-end: IMPORT FAILED'
-    python3 -c 'import pigpio' 2>&1 | head -3 | sed 's/^/    /'
-fi
+# End-to-end check via heredoc so we never need a `"` inside bash. The
+# quoted marker <<'PYEOF' tells bash NOT to interpolate shell vars
+# inside the heredoc, so Python sees the code exactly as written.
+python3 2>&1 <<'PYEOF'
+try:
+    import pigpio
+except Exception as e:
+    print('  pigpio end-to-end: IMPORT FAILED')
+    print('    ' + repr(e))
+else:
+    p = pigpio.pi()
+    if p.connected:
+        print('  pigpio end-to-end: OK')
+        p.stop()
+    else:
+        print('  pigpio end-to-end: socket UNREACHABLE - daemon not listening?')
+PYEOF
 '@
 
     Write-Host "  [3/8] Waveshare E-Ink driver" -ForegroundColor Cyan

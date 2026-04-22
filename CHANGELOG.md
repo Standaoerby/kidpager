@@ -3,6 +3,48 @@
 ## v0.14 — 2026-04-22
 
 ### Fixed
+- **Terminus font was never actually used.** The font loader in
+  `display_eink.py` used `isinstance(FONT, ImageFont.ImageFont)` to
+  decide whether to fall back from Terminus to DejaVu. That check is
+  broken in both directions depending on Pillow version. On Pillow
+  < 10 (Bookworm) `FreeTypeFont` is a subclass of `ImageFont`, so the
+  check is always True and DejaVu **always** wins -- meaning the
+  whole premise of v0.14's "switch to Terminus to fix letter-merging
+  on 1-bpp" quietly wasn't happening. On Pillow >= 10 (our actual
+  Trixie target) `FreeTypeFont` is no longer a subclass, so the check
+  is always False and the DejaVu fallback is never reached -- a
+  missing Terminus would land on Pillow's bundled Aileron BytesIO
+  font at an indeterminate size. Replaced the check with a sentinel
+  pattern (`_load_font` returns `None` on failure; call sites chain
+  with `or`) which is correct across all Pillow versions. Startup
+  log now also prints `<pillow bundled default>` instead of a BytesIO
+  repr when that path is taken.
+- **Double E-Ink refresh on every keystroke in name/channel edit
+  menus.** `_handle_name_edit` calls `full_redraw()` synchronously
+  after each character. Separately, the main loop saw
+  `isinstance(key, str) and len(key) == 1` and set `got_typing =
+  True`, which armed a SECOND debounced refresh ~0.3 s later.
+  Every typed character in the name editor was flashing the panel
+  twice. Fixed by having `_handle_chat` return an explicit `"typing"`
+  signal that main.py consumes; non-chat handlers (which already do
+  their own `full_redraw`) return `None`. Typing in chat still goes
+  through the debounce; name/channel edits no longer get a redundant
+  second refresh.
+- **UP/DOWN scroll at the boundary still flashed the panel.**
+  Pressing UP at the oldest message, or DOWN at the newest, clamped
+  `self.scroll` to the same value but still called `full_redraw()`.
+  Partial refresh, but still ~300 ms of wasted flashes per bounce.
+  Now skipped if the scroll position didn't change.
+- **Non-atomic `config.json` / `history.json` writes were power-loss
+  vulnerable.** A browned-out LiPo during `fwrite()` would leave a
+  truncated JSON on disk, and `_load_history` / `Config.load` would
+  then catch the parse error and reset to defaults, losing the user's
+  name, channel, silent flag, and the chat history. Both writes now
+  use the standard tmp+fsync+`os.replace` atomic pattern: either the
+  old file or the new one is on disk, never a half-written one. No
+  stale `.tmp` files accumulate under normal operation; a power cut
+  inside the window leaves one `.tmp` that the next successful write
+  overwrites.
 - **Ghosting after wake from sleep.** Pressing a key on the sleep
   screen returned the pager to the chat view via partial refresh,
   leaving a faint "Zzz" + name residue underneath the chat content
@@ -81,6 +123,18 @@
   full visible glyph in one press.
 
 ### Changed
+- **Emoji shortcut lookup is ~10x faster on the typical non-matching
+  path.** `apply_emoji_shortcuts` was iterating all 15 sequences with
+  `endswith` on every keystroke. Most keys don't land on a shortcut
+  trigger at all (letters, digits, space). Now pre-indexed by the
+  last character of each sequence (`_EMOJI_BY_LAST`); a single dict
+  lookup rejects non-trigger keystrokes in ~0.1 µs instead of running
+  15 `endswith` checks at ~1 µs. Matching behavior is identical
+  (longest-first within each bucket, trailing-only match).
+- **`main.py` drain loop no longer stamps `time.time()` per key.**
+  A 128-key burst was calling `time.time()` 128 times; hoisted to
+  once per tick. All keys in a single ~10 ms drain belong to the
+  same typing instant for debounce purposes.
 - **`keyboard.py` almost entirely rewritten.** New surface:
   `poll()` (non-blocking deque pop, replaces `read_key_sync` which
   stays as an alias for one release), `queue_depth()`, `dropped()`.

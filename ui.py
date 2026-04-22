@@ -79,13 +79,30 @@ EMOJI_SHORTCUTS = [
 ]
 _EMOJI_SORTED = sorted(EMOJI_SHORTCUTS, key=lambda kv: -len(kv[0]))
 
+# Fast lookup: index the shortcut table by the LAST character of each
+# sequence. Most keystrokes (letters, digits, space) won't end on a
+# trigger char, so we can reject them with a single dict lookup instead
+# of iterating all 15 sequences and running endswith on each. The
+# values are still longest-first within their bucket so ":'(" still
+# matches before ":(" and "o_O" before nothing-with-just-O.
+_EMOJI_BY_LAST = {}
+for _seq, _emoji in _EMOJI_SORTED:
+    _EMOJI_BY_LAST.setdefault(_seq[-1], []).append((_seq, _emoji))
+
 
 def apply_emoji_shortcuts(text):
     """If ``text`` ends with one of the shortcut sequences, replace the
     trailing sequence with the corresponding emoji. Returns
     ``(new_text, replaced)``. Only the trailing position is considered
-    so mid-sentence colons don't get ambushed."""
-    for seq, emoji in _EMOJI_SORTED:
+    so mid-sentence colons don't get ambushed. Fast path: if the final
+    character is not in any shortcut sequence, returns immediately
+    without iterating the table."""
+    if not text:
+        return text, False
+    candidates = _EMOJI_BY_LAST.get(text[-1])
+    if not candidates:
+        return text, False
+    for seq, emoji in candidates:
         if text.endswith(seq):
             return text[:-len(seq)] + emoji, True
     return text, False
@@ -186,8 +203,25 @@ class PagerUI:
             return
         try:
             os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-            with open(HISTORY_FILE, "w") as f:
+            # Atomic write: serialize to a .tmp sibling, fsync so the
+            # page cache hits the SD card, then rename into place.
+            # os.replace is atomic on POSIX for same-filesystem renames,
+            # so a power cut during this sequence leaves either the
+            # old history.json intact or the new one complete -- never
+            # a truncated/corrupt file. Matters on LiPo where a
+            # browned-out cell can yank the Pi mid-fwrite.
+            tmp = HISTORY_FILE + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump([m.to_dict() for m in self.messages[-MAX_HISTORY:]], f)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # fsync unsupported on some filesystems / tmpfs;
+                    # write still lands, just without the SD-card
+                    # barrier guarantee. Keep going.
+                    pass
+            os.replace(tmp, HISTORY_FILE)
             self._dirty = False
         except Exception as e:
             print(f"History save error: {e}")
@@ -219,16 +253,23 @@ class PagerUI:
                        and 0xFE00 <= ord(self.input_buf[-1]) <= 0xFE0F):
                     self.input_buf = self.input_buf[:-1]
                 self.input_buf = self.input_buf[:-1]
+                return "typing"
         elif key == "ESC" or key == "TAB":
             self.state = "profile"
             self.profile_sel = 0
             self.full_redraw()
         elif key == "UP":
-            self.scroll = min(self.scroll + 1, max(0, len(self.messages) - 1))
-            self.full_redraw()
+            # Skip redraw if we're already at the max scroll -- E-Ink
+            # wear-saving on bounce-scrolling past the oldest message.
+            new = min(self.scroll + 1, max(0, len(self.messages) - 1))
+            if new != self.scroll:
+                self.scroll = new
+                self.full_redraw()
         elif key == "DOWN":
-            self.scroll = max(0, self.scroll - 1)
-            self.full_redraw()
+            new = max(0, self.scroll - 1)
+            if new != self.scroll:
+                self.scroll = new
+                self.full_redraw()
         elif isinstance(key, str) and len(key) == 1:
             self.input_buf += key
             self.scroll = 0
@@ -236,6 +277,11 @@ class PagerUI:
             # key. Mid-buffer shortcuts that the user types past
             # without pausing are expanded later in get_message().
             self.input_buf, _ = apply_emoji_shortcuts(self.input_buf)
+            # Signal "typing in progress" explicitly so main.py's
+            # debounce logic only arms for real chat-typing and
+            # doesn't pile a second E-Ink refresh on top of the
+            # handler-level full_redraw that name/channel editors do.
+            return "typing"
         return None
 
     def _handle_profile(self, key):

@@ -7,8 +7,6 @@ class Config:
         self.path = path
         self.name = "Kid"
         self.channel = 1
-        # Silent mode: when True, all buzzer tones are suppressed. Toggled from
-        # the profile menu, persisted here so it survives reboot.
         self.silent = False
 
     def load(self):
@@ -23,8 +21,19 @@ class Config:
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w") as f:
+        # Atomic write: tmp + fsync + rename. Prevents a power cut
+        # mid-save from corrupting config.json and losing the user's
+        # name / channel / silent preference. Matters especially for
+        # silent-mode toggle which writes config every time it flips.
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(
                 {"name": self.name, "channel": self.channel, "silent": self.silent},
                 f, indent=2,
             )
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, self.path)

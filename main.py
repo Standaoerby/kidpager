@@ -94,7 +94,7 @@ async def main():
 
     try:
         while True:
-            got_typing = False  # a printable character was added
+            got_typing = False  # a printable character was added in chat state
             action = None
 
             # Drain the keyboard queue. The reader thread keeps
@@ -106,19 +106,26 @@ async def main():
                 if key is None:
                     break
                 drained += 1
+                a = ui.handle_key(key)
+                if a == "send":             action = "send"
+                elif a == "toggle_wifi":    action = "toggle_wifi"
+                elif a == "silent_changed": action = "silent_changed"
+                elif a == "wake":           action = "wake"
+                elif a == "typing":         got_typing = True
+                # Anything else (None) = non-typing action whose
+                # handler already did its own redraw (menu nav,
+                # name/channel edit). Don't arm debounce for those --
+                # that was the v0.14 bug where name editing got two
+                # E-Ink refreshes per keystroke.
+
+            # Hoist time.time() out of the per-key loop. All keys in a
+            # single drain burst belong to the same ~10 ms tick so
+            # stamping them with one timestamp is accurate enough for
+            # the TYPING_SETTLE / IDLE_TIMEOUT heuristics and avoids
+            # up to KB_DRAIN_MAX=128 syscalls per tick.
+            if drained > 0:
                 last_key = time.time()
                 last_activity = last_key
-                a = ui.handle_key(key)
-                if a == "send":           action = "send"
-                elif a == "toggle_wifi":  action = "toggle_wifi"
-                elif a == "silent_changed": action = "silent_changed"
-                elif a == "wake":         action = "wake"
-                else:
-                    # Any None return from a printable key in chat is
-                    # "typing in progress" -- flag so we schedule a
-                    # redraw via the debounce path.
-                    if isinstance(key, str) and len(key) == 1:
-                        got_typing = True
 
             # Dropped-key diagnostics
             dropped_now = kb.dropped()
