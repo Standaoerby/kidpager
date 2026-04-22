@@ -21,8 +21,8 @@
 #   no-op if the key is already authorized.
 #
 # Idempotent: safe to re-run. Repairs a broken install (missing pigpiod
-# daemon, missing systemd unit, non-executable bt_pair.sh, stale config)
-# without re-flashing.
+# daemon, missing Python pigpio module, missing systemd unit, non-executable
+# bt_pair.sh, stale config) without re-flashing.
 #
 # ---------------------------------------------------------------------------
 # Pre-requisites (set in rpi-imager BEFORE flashing -- saves half a day of
@@ -322,54 +322,133 @@ foreach ($dest in $targets) {
     $t = "${PiUser}@${ip}"
 
     Write-Host "  [1/8] Packages" -ForegroundColor Cyan
-    # python3-pigpio is the Python client library, available on Trixie.
-    # The pigpiod daemon itself is NOT packaged on Trixie Lite -- git +
-    # build-essential are needed to build it from source in step [2/8].
-    ssh @sshCmd $t "sudo apt update -qq 2>/dev/null; sudo apt install -y python3-spidev python3-rpi.gpio python3-pil python3-gpiozero python3-pigpio git build-essential bluez fonts-dejavu-core wget rfkill 2>/dev/null | tail -1"
+    # Tolerant apt flow:
+    #   * The main install line is best-effort; missing packages in a particular
+    #     Raspberry Pi OS snapshot will not kill the deploy because the pigpio
+    #     self-heal in step [2/8] and the Terminus fallback below cover gaps.
+    #   * python3-pigpio: Python client library for pigpiod. Name on Debian
+    #     Trixie/Bookworm. Step [2/8] has a multi-strategy heal (retry-apt ->
+    #     pip --break-system-packages -> copy pigpio.py from source).
+    #   * python3-pip: needed for the pip fallback above.
+    #   * fonts-terminus-otb: bitmap font for the v0.14+ E-Ink rendering (fixes
+    #     "love" letter-merging bug). Try otb first, then xfonts-terminus.
+    #     If both are unavailable, display_eink.py falls back to DejaVu at
+    #     runtime so the pager still works, just with v0.13 rendering.
+    #   * git + build-essential: needed to build pigpiod from source in [2/8]
+    #     (not packaged on Raspberry Pi OS Trixie Lite).
+    ssh @sshCmd $t @'
+sudo apt update -qq 2>/dev/null
+sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+    python3-spidev python3-rpi.gpio python3-pil python3-gpiozero \
+    python3-pigpio python3-pip \
+    git build-essential bluez \
+    fonts-dejavu-core \
+    wget rfkill 2>&1 | tail -1
+
+# Terminus bitmap font (for v0.14+ UI). Prefer otb (Debian Trixie/Bookworm),
+# fall back to older xfonts-terminus. Failures here are non-fatal -- the
+# display driver falls back to DejaVu automatically.
+if ! dpkg -s fonts-terminus-otb >/dev/null 2>&1 && ! dpkg -s xfonts-terminus >/dev/null 2>&1; then
+    if sudo DEBIAN_FRONTEND=noninteractive apt install -y fonts-terminus-otb 2>/dev/null; then
+        echo "  Terminus: fonts-terminus-otb installed"
+    elif sudo DEBIAN_FRONTEND=noninteractive apt install -y xfonts-terminus 2>/dev/null; then
+        echo "  Terminus: xfonts-terminus installed (fallback)"
+    else
+        echo "  Terminus: UNAVAILABLE -- display will use DejaVu fallback"
+    fi
+else
+    echo "  Terminus: already installed"
+fi
+'@
 
     Write-Host "  [2/8] SPI + pigpiod (build daemon from source)" -ForegroundColor Cyan
-    # Trixie Lite has python3-pigpio (client library) but no pigpiod (C
-    # daemon) package. Build from source. Idempotent: skips if binary
-    # already present, self-heals if Python module went missing after a
-    # partial step [1/8] install.
-    ssh @sshCmd $t @"
-set -e
+    # Trixie Lite has python3-pigpio (client library) but no pigpiod (C daemon)
+    # package. Build from source.
+    #
+    # Multi-strategy self-heal for the Python client binding. pigpio is the
+    # Python socket client that talks to the pigpiod daemon; without it,
+    # buzzer.py silently falls back to no-op (pager works but no sound).
+    # Three strategies, tried in order:
+    #   A) apt install python3-pigpio (maybe step [1/8] had a transient failure)
+    #   B) pip install --break-system-packages (PEP 668 override, pypi fallback)
+    #   C) cp pigpio.py out of the cloned github source tree (pure-python
+    #      client, no compilation required -- always works if A and B fail)
+    # Each strategy reports its result and only runs if the previous didn't fix
+    # it. Idempotent: skips steps whose output is already healthy.
+    #
+    # NOTE: we deliberately DON'T use `set -e` here -- each step must be
+    # allowed to fail so the next strategy gets a chance. Every failure is
+    # logged, nothing is silently swallowed.
+    ssh @sshCmd $t @'
 sudo raspi-config nonint do_spi 0 2>/dev/null || true
 
-# --- (1) pigpiod C daemon -------------------------------------------------
-if [ ! -x /usr/local/bin/pigpiod ]; then
+# --- (1) pigpiod C daemon ------------------------------------------------
+if [ ! -x /usr/local/bin/pigpiod ] && [ ! -x /usr/bin/pigpiod ]; then
     echo '  Building pigpio from source (2-3 minutes, be patient)...'
     cd /tmp && rm -rf pigpio
-    git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1
-    cd pigpio && make -j4 >/dev/null 2>&1
-    # We only need the C library + daemon binary. The Makefile's Python
-    # install step fails on Py3.12+ (distutils removed); we handle bindings
-    # separately below.
-    sudo make install 2>/dev/null || true
-    sudo ldconfig
-    echo '  pigpiod built and installed'
+    if git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1; then
+        cd pigpio
+        make -j4 >/dev/null 2>&1
+        # Only need the C library + daemon binary. The Makefile's Python
+        # install step fails on Py3.12+ (distutils removed); (2) handles that.
+        sudo make install 2>/dev/null
+        sudo ldconfig
+        if [ -x /usr/local/bin/pigpiod ]; then
+            echo '  pigpiod built and installed'
+        else
+            echo '  pigpiod build FAILED (check network / make output)'
+        fi
+    else
+        echo '  pigpiod build FAILED: git clone error'
+    fi
 else
     echo '  pigpiod daemon already installed'
 fi
 
-# --- (2) pigpio Python client --------------------------------------------
-# Try apt first; fall back to copying pigpio.py straight out of the source
-# tree (pure Python socket client -- no compile needed).
-if ! python3 -c 'import pigpio' 2>/dev/null; then
-    echo '  pigpio Python module missing, self-healing...'
-    if [ ! -f /tmp/pigpio/pigpio.py ]; then
-        cd /tmp && rm -rf pigpio
-        git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1
+# --- (2) pigpio Python client: multi-strategy heal ------------------------
+if python3 -c 'import pigpio' 2>/dev/null; then
+    echo '  pigpio Python: already importable'
+else
+    echo '  pigpio Python: missing, trying strategies...'
+
+    # Strategy A: retry apt (step [1/8] may have had transient failure)
+    echo '    [A] apt install python3-pigpio'
+    sudo DEBIAN_FRONTEND=noninteractive apt install -y python3-pigpio 2>&1 | tail -1
+    if python3 -c 'import pigpio' 2>/dev/null; then
+        echo '    [A] OK: apt install worked'
+    else
+        # Strategy B: pip install with PEP 668 override
+        echo '    [B] pip install pigpio --break-system-packages'
+        sudo pip3 install pigpio --break-system-packages 2>&1 | tail -2
+        if python3 -c 'import pigpio' 2>/dev/null; then
+            echo '    [B] OK: pip install worked'
+        else
+            # Strategy C: copy pigpio.py out of the github source tree
+            echo '    [C] copy pigpio.py from github source'
+            if [ ! -f /tmp/pigpio/pigpio.py ]; then
+                cd /tmp && rm -rf pigpio
+                git clone --depth 1 https://github.com/joan2937/pigpio.git >/dev/null 2>&1
+            fi
+            if [ -f /tmp/pigpio/pigpio.py ]; then
+                DEST=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null)
+                [ -z "$DEST" ] && DEST=/usr/local/lib/python3/dist-packages
+                sudo mkdir -p "$DEST"
+                sudo cp /tmp/pigpio/pigpio.py "$DEST/pigpio.py"
+                if python3 -c 'import pigpio' 2>/dev/null; then
+                    echo "    [C] OK: pigpio.py copied to $DEST"
+                else
+                    echo "    [C] FAIL: copied but import still errors"
+                    python3 -c 'import pigpio' 2>&1 | head -3 | sed 's/^/        /'
+                fi
+            else
+                echo '    [C] FAIL: no pigpio.py in github clone (network?)'
+            fi
+        fi
     fi
-    DEST=`$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)
-    [ -z "`$DEST" ] && DEST=/usr/local/lib/python3/dist-packages
-    sudo mkdir -p "`$DEST"
-    sudo cp /tmp/pigpio/pigpio.py "`$DEST/pigpio.py"
-    echo "  pigpio.py copied to `$DEST"
 fi
 
 # --- (3) systemd unit ----------------------------------------------------
-if [ ! -f /lib/systemd/system/pigpiod.service ]; then
+if [ ! -f /lib/systemd/system/pigpiod.service ] && [ ! -f /etc/systemd/system/pigpiod.service ]; then
     sudo tee /lib/systemd/system/pigpiod.service >/dev/null <<'UNIT'
 [Unit]
 Description=Daemon required to control GPIO pins via pigpio
@@ -389,9 +468,22 @@ fi
 sudo systemctl daemon-reload
 sudo systemctl enable pigpiod --now 2>/dev/null
 sleep 1
-systemctl is-active pigpiod 2>/dev/null | grep -q active && echo '  pigpiod: active' || echo '  pigpiod: FAILED'
-python3 -c 'import pigpio; p=pigpio.pi(); print("  pigpio socket: OK" if p.connected else "  pigpio socket: UNREACHABLE"); (p.stop() if p.connected else None)' 2>/dev/null || echo '  pigpio module: IMPORT FAILED'
-"@
+
+if systemctl is-active --quiet pigpiod; then
+    echo '  pigpiod: active'
+else
+    echo '  pigpiod: NOT active'
+    sudo systemctl status pigpiod --no-pager -n 5 2>/dev/null | head -10 | sed 's/^/    /'
+fi
+
+# Final end-to-end check: Python module AND socket reachable.
+if python3 -c "import pigpio; p=pigpio.pi(); print('  pigpio end-to-end: OK' if p.connected else '  pigpio end-to-end: socket UNREACHABLE (daemon not listening?)'); (p.stop() if p.connected else None)" 2>&1; then
+    :
+else
+    echo '  pigpio end-to-end: IMPORT FAILED'
+    python3 -c 'import pigpio' 2>&1 | head -3 | sed 's/^/    /'
+fi
+'@
 
     Write-Host "  [3/8] Waveshare E-Ink driver" -ForegroundColor Cyan
     ssh @sshCmd $t "mkdir -p ~/waveshare_epd; B=https://raw.githubusercontent.com/waveshare/e-Paper/master/RaspberryPi_JetsonNano/python/lib/waveshare_epd; for F in __init__.py epdconfig.py epd2in13_V4.py; do test -f ~/waveshare_epd/`$F || wget -q -O ~/waveshare_epd/`$F `$B/`$F; done; test -f ~/waveshare_epd/epd2in13_V4.py && echo OK || echo FAIL"
@@ -492,7 +584,8 @@ test -x /usr/local/bin/pigpiod                && echo '[OK] pigpiod binary'     
 test -f /lib/systemd/system/pigpiod.service   && echo '[OK] pigpiod unit'            || echo '[!!] pigpiod unit missing'
 ls /dev/spidev0.0 >/dev/null 2>&1             && echo '[OK] SPI CE0 (E-Ink)'         || echo '[!!] SPI CE0 missing'
 ls /dev/spidev0.1 >/dev/null 2>&1             && echo '[OK] SPI CE1 (LoRa)'          || echo '[!!] SPI CE1 missing'
-test -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf && echo '[OK] Fonts'         || echo '[!!] Fonts missing'
+test -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf && echo '[OK] DejaVu fonts'  || echo '[!!] DejaVu fonts missing'
+(ls /usr/share/fonts/X11/misc/ter-u14n.* 2>/dev/null | grep -q ter || ls /usr/share/fonts/X11/misc/*terminus* 2>/dev/null | grep -q terminus) && echo '[OK] Terminus font' || echo '[  ] Terminus font NOT installed (DejaVu fallback will be used)'
 systemctl is-enabled kidpager       2>/dev/null | grep -q enabled && echo '[OK] kidpager autostart'          || echo '[!!] kidpager autostart'
 systemctl is-enabled kidpager-power 2>/dev/null | grep -q enabled && echo '[OK] Power-save (active on boot)' || echo '[!!] Power-save NOT enabled'
 systemctl is-active  pigpiod        2>/dev/null | grep -q active  && echo '[OK] pigpiod running'             || echo '[!!] pigpiod NOT running'

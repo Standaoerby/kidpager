@@ -3,6 +3,15 @@
 ## v0.14 — 2026-04-22
 
 ### Fixed
+- **Ghosting after wake from sleep.** Pressing a key on the sleep
+  screen returned the pager to the chat view via partial refresh,
+  leaving a faint "Zzz" + name residue underneath the chat content
+  for the rest of the session (or until the next 20-frame full
+  refresh caught up). Same problem on the incoming-message wake
+  path. Both wake paths now arm a one-shot `_force_next_full` flag
+  on `PagerUI`; the next `draw_chat` call consumes it and forces a
+  full E-Ink refresh (one ~2 s flash), clearing the ghost completely.
+  Mirrors the v0.13 fix for entering the sleep screen from chat.
 - **Dropped characters while typing.** Fast typing ("hello") sometimes
   came out as "hllo" or "helo". Root cause was the main asyncio loop
   owning the evdev read path: whenever a full E-Ink refresh (~2 s) or

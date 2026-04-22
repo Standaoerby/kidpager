@@ -154,6 +154,12 @@ class PagerUI:
         self.eink = None
         self.wifi_on = False
         self._dirty = False
+        # When True, the next chat refresh will force a full E-Ink
+        # redraw (init + display) instead of partial. Set by wake paths
+        # (keyboard or incoming message) so the "Zzz" + name sleep
+        # screen doesn't ghost behind the chat view. Consumed (and
+        # cleared) by eink_refresh on the next draw_chat call.
+        self._force_next_full = False
         self._load_history()
         if HAS_EINK:
             try:
@@ -277,6 +283,9 @@ class PagerUI:
 
     def _handle_sleep(self, key):
         self.state = "chat"
+        # Force a full refresh on the next chat draw to clear the sleep
+        # screen (Zzz + name) cleanly -- partial refresh would ghost.
+        self._force_next_full = True
         self.full_redraw()
         return "wake"
 
@@ -288,6 +297,9 @@ class PagerUI:
     def wake(self):
         if self.state == "sleep":
             self.state = "chat"
+            # Same ghosting cleanup as the keyboard-wake path; main.py
+            # calls full_redraw() after this, which will consume the flag.
+            self._force_next_full = True
 
     # ---------- messages ----------
     def get_message(self):
@@ -354,10 +366,13 @@ class PagerUI:
                 if cutoff <= 0:
                     cutoff = 1; start = 0
                 visible = self.messages[start:cutoff]
+                # Consume the one-shot force-full flag (set on wake).
+                force = self._force_next_full
+                self._force_next_full = False
                 self.eink.draw_chat(self.config.name, self.config.channel,
                                     visible, self.input_buf,
                                     self.lora is not None, self.wifi_on,
-                                    self.config.silent)
+                                    self.config.silent, force_full=force)
             elif self.state == "profile":
                 self.eink.draw_profile(self.config.name, self.config.channel,
                                        self.config.silent, self.profile_sel)

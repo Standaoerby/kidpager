@@ -252,7 +252,11 @@ class EInkDisplay:
         print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker) font={os.path.basename(str(font_name))}")
 
     def draw_chat(self, name, channel, messages, input_text,
-                  lora_on=False, wifi_on=False, silent=False):
+                  lora_on=False, wifi_on=False, silent=False,
+                  force_full=False):
+        """Render the chat view. ``force_full=True`` requests a full
+        panel refresh instead of partial -- used on wake from sleep to
+        clear the "Zzz" ghost. All other times partial is fine."""
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
         _draw_header(d, name, lora_on=lora_on, wifi_on=wifi_on, silent=silent)
@@ -297,7 +301,7 @@ class EInkDisplay:
         cursor_x = x_after_prefix + _text_width(FONT, visible_inp)
         d.text((cursor_x, INPUT_TOP), CURSOR, font=FONT, fill=0)
 
-        self._submit(img)
+        self._submit(img, force_full=force_full)
 
     def draw_profile(self, name, channel, silent, selection):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
