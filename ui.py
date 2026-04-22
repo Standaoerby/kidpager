@@ -18,6 +18,21 @@ States:
   "channel_edit" -- number picker for channel
   "sleep"        -- screen saver after IDLE_TIMEOUT seconds of inactivity.
                     Any key or incoming message returns to "chat".
+
+Emoji shortcuts
+---------------
+Typing ``:)`` replaces the trailing 2 chars in the input buffer with
+the slightly-smiling Unicode emoji. Table below. Replacement is done
+at append time (so the E-Ink view already shows the emoji as the user
+types) and again at send time (``expand_emoji_in_full``) to catch any
+shortcuts the user typed past without pausing.
+
+Cursor
+------
+A static underscore ``_`` is drawn at the END of the input buffer. We
+don't support caret movement into the middle of the buffer in this
+release -- LEFT/RIGHT are UI-level navigation keys. If the user wants
+to edit mid-line, backspace is the tool.
 """
 import time, sys, json, os
 
@@ -41,14 +56,59 @@ HISTORY_FILE = os.path.expanduser("~/.kidpager/history.json")
 MAX_HISTORY = 100
 EINK_WINDOW = 30
 
+# Emoji shortcut table. Each entry = (typed_sequence, emoji_char).
+# The emoji is sent on the air as UTF-8 like any other character, so
+# nothing in lora.py changes. Entries are sorted longest-first at
+# module load so ":'(" matches before ":(" and "XD" before "X".
+EMOJI_SHORTCUTS = [
+    (":)",  "\U0001F642"),  # 🙂
+    (":(",  "\U0001F641"),  # 🙁
+    (":D",  "\U0001F604"),  # 😄
+    (":P",  "\U0001F61B"),  # 😛
+    (":O",  "\U0001F62E"),  # 😮
+    (";)",  "\U0001F609"),  # 😉
+    ("<3",  "\u2764\uFE0F"), # ❤️
+    (":|",  "\U0001F610"),  # 😐
+    (":*",  "\U0001F618"),  # 😘
+    ("xD",  "\U0001F606"),  # 😆
+    ("XD",  "\U0001F606"),  # 😆
+    (":'(", "\U0001F622"),  # 😢
+    ("^_^", "\U0001F60A"),  # 😊
+    ("o_O", "\U0001F928"),  # 🤨
+    ("O_o", "\U0001F928"),  # 🤨
+]
+_EMOJI_SORTED = sorted(EMOJI_SHORTCUTS, key=lambda kv: -len(kv[0]))
+
+
+def apply_emoji_shortcuts(text):
+    """If ``text`` ends with one of the shortcut sequences, replace the
+    trailing sequence with the corresponding emoji. Returns
+    ``(new_text, replaced)``. Only the trailing position is considered
+    so mid-sentence colons don't get ambushed."""
+    for seq, emoji in _EMOJI_SORTED:
+        if text.endswith(seq):
+            return text[:-len(seq)] + emoji, True
+    return text, False
+
+
+def expand_emoji_in_full(text):
+    """Expand every occurrence of every shortcut anywhere in ``text``.
+    Run at send time so messages like "hi :) ok :(" come out correctly
+    even if the user didn't pause between shortcuts (the trailing-only
+    replacement would have missed the middle one)."""
+    for seq, emoji in _EMOJI_SORTED:
+        if seq in text:
+            text = text.replace(seq, emoji)
+    return text
+
 
 def relative_time(ts):
     diff = time.time() - ts
     if diff < 10: return "now"
     elif diff < 60: return f"{int(diff)}s"
-    elif diff < 3600: return f"{int(diff/60)}m"
-    elif diff < 86400: return f"{int(diff/3600)}h"
-    else: return f"{int(diff/86400)}d"
+    elif diff < 3600: return f"{int(diff / 60)}m"
+    elif diff < 86400: return f"{int(diff / 3600)}h"
+    else: return f"{int(diff / 86400)}d"
 
 
 class Message:
@@ -66,18 +126,17 @@ class Message:
             self.status = STATUS_SENDING if (outgoing and msg_id) else STATUS_LOCAL
 
     def to_dict(self):
-        return {"sender":self.sender,"text":self.text,"outgoing":self.outgoing,
-                "msg_id":self.msg_id,"timestamp":self.timestamp,"status":self.status}
+        return {"sender": self.sender, "text": self.text, "outgoing": self.outgoing,
+                "msg_id": self.msg_id, "timestamp": self.timestamp, "status": self.status}
 
     @staticmethod
     def from_dict(d):
-        return Message(sender=d["sender"],text=d["text"],outgoing=d.get("outgoing",False),
-                      msg_id=d.get("msg_id"),timestamp=d.get("timestamp"),status=d.get("status",STATUS_LOCAL))
+        return Message(sender=d["sender"], text=d["text"], outgoing=d.get("outgoing", False),
+                       msg_id=d.get("msg_id"), timestamp=d.get("timestamp"),
+                       status=d.get("status", STATUS_LOCAL))
 
 
 class PagerUI:
-    # Profile menu item indices. Kept as constants so main.py or tests can
-    # reference them by name rather than by integer.
     PROF_NAME = 0
     PROF_CHANNEL = 1
     PROF_SILENT = 2
@@ -129,10 +188,8 @@ class PagerUI:
 
     # ---------- key dispatch ----------
     def handle_key(self, key):
-        # Alt+W is global: toggles Wi-Fi from any screen, doesn't consume input.
         if key == "WIFI":
             return "toggle_wifi"
-        # Sleep state takes precedence: any key wakes into chat and is consumed.
         if self.state == "sleep":
             return self._handle_sleep(key)
         if self.state == "chat":           return self._handle_chat(key)
@@ -145,10 +202,21 @@ class PagerUI:
         self.wifi_on = bool(on)
 
     def _handle_chat(self, key):
-        if key == "ENTER": return "send"
-        elif key == "BACKSPACE": self.input_buf = self.input_buf[:-1]
+        if key == "ENTER":
+            return "send"
+        elif key == "BACKSPACE":
+            if self.input_buf:
+                # Strip trailing Unicode variation selectors (U+FE00-FE0F)
+                # first so one backspace deletes the visible glyph (e.g.
+                # the emoji-style heart is ❤ + VS16).
+                while (self.input_buf
+                       and 0xFE00 <= ord(self.input_buf[-1]) <= 0xFE0F):
+                    self.input_buf = self.input_buf[:-1]
+                self.input_buf = self.input_buf[:-1]
         elif key == "ESC" or key == "TAB":
-            self.state = "profile"; self.profile_sel = 0; self.full_redraw()
+            self.state = "profile"
+            self.profile_sel = 0
+            self.full_redraw()
         elif key == "UP":
             self.scroll = min(self.scroll + 1, max(0, len(self.messages) - 1))
             self.full_redraw()
@@ -156,7 +224,12 @@ class PagerUI:
             self.scroll = max(0, self.scroll - 1)
             self.full_redraw()
         elif isinstance(key, str) and len(key) == 1:
-            self.input_buf += key; self.scroll = 0
+            self.input_buf += key
+            self.scroll = 0
+            # Trailing-only shortcut replacement after each printable
+            # key. Mid-buffer shortcuts that the user types past
+            # without pausing are expanded later in get_message().
+            self.input_buf, _ = apply_emoji_shortcuts(self.input_buf)
         return None
 
     def _handle_profile(self, key):
@@ -170,7 +243,6 @@ class PagerUI:
             elif self.profile_sel == self.PROF_CHANNEL:
                 self.state = "channel_edit"; self.full_redraw()
             elif self.profile_sel == self.PROF_SILENT:
-                # Toggle in place, no sub-screen. Persist so it survives reboot.
                 self.config.silent = not self.config.silent
                 self.config.save()
                 self.full_redraw()
@@ -182,46 +254,49 @@ class PagerUI:
         return None
 
     def _handle_name_edit(self, key):
-        if key == "ENTER": self.config.save(); self.state = "profile"; self.full_redraw()
-        elif key == "BACKSPACE": self.config.name = self.config.name[:-1]; self.full_redraw()
-        elif key == "ESC" or key == "TAB": self.state = "profile"; self.full_redraw()
-        elif isinstance(key, str) and len(key) == 1: self.config.name += key; self.full_redraw()
+        if key == "ENTER":
+            self.config.save(); self.state = "profile"; self.full_redraw()
+        elif key == "BACKSPACE":
+            self.config.name = self.config.name[:-1]; self.full_redraw()
+        elif key == "ESC" or key == "TAB":
+            self.state = "profile"; self.full_redraw()
+        elif isinstance(key, str) and len(key) == 1:
+            self.config.name += key; self.full_redraw()
         return None
 
     def _handle_channel_edit(self, key):
-        if key == "ENTER": self.config.save(); self.state = "profile"; self.full_redraw()
-        elif key in ("UP", "RIGHT"): self.config.channel = min(99, self.config.channel + 1); self.full_redraw()
-        elif key in ("DOWN", "LEFT"): self.config.channel = max(1, self.config.channel - 1); self.full_redraw()
-        elif key == "ESC" or key == "TAB": self.state = "profile"; self.full_redraw()
+        if key == "ENTER":
+            self.config.save(); self.state = "profile"; self.full_redraw()
+        elif key in ("UP", "RIGHT"):
+            self.config.channel = min(99, self.config.channel + 1); self.full_redraw()
+        elif key in ("DOWN", "LEFT"):
+            self.config.channel = max(1, self.config.channel - 1); self.full_redraw()
+        elif key == "ESC" or key == "TAB":
+            self.state = "profile"; self.full_redraw()
         return None
 
     def _handle_sleep(self, key):
-        """Any keypress wakes into chat. The key itself is NOT consumed as
-        input (so an accidental bump doesn't start typing). Returns 'wake' so
-        main.py knows to update last_activity and skip further beep logic."""
         self.state = "chat"
         self.full_redraw()
         return "wake"
 
-    # ---------- sleep transitions (called from main.py) ----------
     def enter_sleep(self):
-        """Switch to the screen-saver view. Called by main.py when the user
-        has been idle for longer than IDLE_TIMEOUT. Safe to call from any
-        state: just renders the sleep screen; wake-up restores chat."""
         if self.state != "sleep":
             self.state = "sleep"
             self.full_redraw()
 
     def wake(self):
-        """Transition from sleep back to chat. Used by main.py on incoming
-        messages -- main.py is responsible for calling full_redraw() after
-        so the new message is drawn immediately."""
         if self.state == "sleep":
             self.state = "chat"
 
     # ---------- messages ----------
     def get_message(self):
-        msg = self.input_buf.strip(); self.input_buf = ""; return msg
+        """Return the send-ready string (shortcuts expanded, whitespace
+        stripped) and clear the input buffer."""
+        msg = self.input_buf.strip()
+        msg = expand_emoji_in_full(msg)
+        self.input_buf = ""
+        return msg
 
     def add_message(self, sender, text, outgoing=False, msg_id=None):
         if not outgoing and msg_id:
@@ -242,7 +317,8 @@ class PagerUI:
         return False
 
     def check_timeouts(self):
-        changed = False; now = time.time()
+        changed = False
+        now = time.time()
         for m in self.messages:
             if m.status != STATUS_SENDING:
                 continue
@@ -264,10 +340,13 @@ class PagerUI:
         return changed
 
     # ---------- rendering ----------
-    def full_redraw(self): self._term_redraw(); self.eink_refresh()
+    def full_redraw(self):
+        self._term_redraw()
+        self.eink_refresh()
 
     def eink_refresh(self):
-        if not self.eink: return
+        if not self.eink:
+            return
         try:
             if self.state == "chat":
                 cutoff = len(self.messages) - self.scroll
@@ -292,9 +371,15 @@ class PagerUI:
             print(f"E-Ink error: {e}")
 
     def _term_redraw(self):
+        # Skip terminal redraw when not on a TTY. Under systemd stdout
+        # is the journal, and pumping clear-screen escape codes into
+        # it on every keystroke is both noisy and slow (measurable
+        # latency added to the input path).
+        if not sys.stdout.isatty():
+            return
         lora = "LoRa:ON" if self.lora else "LoRa:OFF"
         wifi = "  WiFi:ON" if self.wifi_on else ""
-        mute = "  MUTE"   if self.config.silent else ""
+        mute = "  MUTE" if self.config.silent else ""
         sleep_tag = "  [SLEEP]" if self.state == "sleep" else ""
         print(f"\033[2J\033[H KidPager [{self.config.name}]  {lora}{wifi}{mute}{sleep_tag}")
         print("-" * 50)
@@ -316,4 +401,7 @@ class PagerUI:
         print("=" * 50)
 
     def term_input_line(self):
-        sys.stdout.write(f"\r > {self.input_buf}_   \r"); sys.stdout.flush()
+        if not sys.stdout.isatty():
+            return
+        sys.stdout.write(f"\r > {self.input_buf}_   \r")
+        sys.stdout.flush()

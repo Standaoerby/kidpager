@@ -1,79 +1,88 @@
 # Publishing to GitHub
 
-Quick guide to create a new GitHub repository and push this release as tag `v0.9`.
+Quick guide for tagging and pushing a new KidPager release. Current
+release: **v0.13**.
 
-## 1. Create an empty repository on GitHub
+## First-time setup (only once per machine)
 
-Go to https://github.com/new and create a new **empty** repo:
+Go to https://github.com/new and create an **empty** repo:
 
 - **Repository name:** `kidpager`
 - **Description:** `Two-device LoRa text messenger for kids, on Raspberry Pi Zero 2 W`
 - **Visibility:** Public or Private, your choice
-- **DO NOT** check "Add README", "Add .gitignore", or "Choose a license" — this release already contains them
+- **DO NOT** check "Add README", "Add .gitignore", or "Choose a license"
+  — this release already contains them
 
-Click **Create repository**. On the next page GitHub will show you the URL, e.g.:
+Click **Create repository**. Note the URL:
 ```
 https://github.com/YOUR_USERNAME/kidpager.git
 ```
 
-## 2. Initialize and push from the release folder
-
-Open PowerShell (or terminal) in the folder with this release:
+Initialize and push:
 
 ```powershell
-cd path\to\kidpager-0.9
+cd path\to\kidpager
 
 git init
 git add .
-git commit -m "Release 0.9"
+git commit -m "Initial commit"
 git branch -M main
-
-# Replace YOUR_USERNAME with your actual GitHub username
 git remote add origin https://github.com/YOUR_USERNAME/kidpager.git
 git push -u origin main
 ```
 
-If this is the first time you push to GitHub from this machine, you'll be asked for credentials.
-Use a Personal Access Token, not your password — generate one at:
-https://github.com/settings/tokens (scope: `repo`).
+First push asks for credentials. Use a Personal Access Token, not your
+password — generate one at https://github.com/settings/tokens (scope: `repo`).
 
-## 3. Create the 0.9 tag and release
+## Release v0.13 (current)
 
 ```powershell
-git tag -a v0.9 -m "KidPager 0.9 — first public release"
-git push origin v0.9
+# Make sure everything is committed
+git add .
+git commit -m "Release v0.13 — sleep-screen ghosting fix + wifi-gated auto-sleep"
+git push
+
+# Tag and push the tag
+git tag -a v0.13 -m "KidPager v0.13 — clean sleep screen, Wi-Fi-aware auto-sleep"
+git push origin v0.13
 ```
 
 Then on GitHub:
 
 1. Go to your repo → **Releases** (right sidebar) → **Draft a new release**
-2. **Choose a tag:** select `v0.9`
-3. **Release title:** `KidPager 0.9`
+2. **Choose a tag:** select `v0.13`
+3. **Release title:** `KidPager v0.13`
 4. **Description:** copy the contents of `RELEASE_NOTES.md` into the description box
-5. Optionally attach the release archive (e.g. `kidpager-0.9.zip`) as a binary asset
-6. Click **Publish release**
+5. Click **Publish release**
 
-## 4. Verify
+## Release checklist (for any future version)
 
-Your repo now has:
-- `main` branch with all source files
-- Tag `v0.9` pointing at this release
-- A published GitHub Release page with notes
-- README rendered on the repo landing page
+Before tagging, make sure these are consistent:
+
+- [ ] `CHANGELOG.md` has a new section at the top for this version
+- [ ] `RELEASE_NOTES.md` describes the new version (replace old content, or keep and rename to `RELEASE_NOTES_vN.md`)
+- [ ] `README.md` — any new features or hardware changes reflected
+- [ ] `BOM.md` — any new components in the per-unit BOM
+- [ ] `PUBLISH.md` — version number in the commands matches
+- [ ] `diagnose.py` — if you added a new `.py` file, it's in the file-presence check
+- [ ] `deploy.ps1` `$PY_FILES` — same, new file copied to the pager
+- [ ] All `.py` files parse (`python3 -m py_compile *.py`)
+- [ ] `test_retry.py` passes (if you touched `ui.py`)
+- [ ] Diagnose green on a live pager (`.\deploy.ps1 -Diag`)
 
 ## Future updates
 
-For subsequent versions:
+For subsequent versions, bump the patch (v0.14) for bug fixes, minor (v0.20)
+for feature additions, major (v1.0) once the project is considered stable:
 
 ```powershell
-# make your changes
 git add .
 git commit -m "Describe what changed"
 git push
 
-# when ready to tag another release
-git tag -a v0.10 -m "KidPager 0.10 — what's new"
-git push origin v0.10
+git tag -a v0.14 -m "KidPager v0.14 — what's new in one sentence"
+git push origin v0.14
 ```
 
-Then draft a new release on GitHub for tag `v0.10`.
+Then draft a new release on GitHub for that tag with the RELEASE_NOTES.md
+content pasted in.

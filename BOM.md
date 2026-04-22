@@ -12,23 +12,58 @@ Everything you need to build **two** pagers (each pager is pointless by itself
 | 3 | E-Ink HAT | **Waveshare 2.13" V4** (250×122, mono) | 1 | $20 | Waveshare SKU 19717; V4 specifically (V2/V3 have different driver init) |
 | 4 | LoRa module | **Waveshare Core1262-HF** (SX1262, 868 MHz) | 1 | $12 | the -HF (+22 dBm HP PA). Core1262-LF is 433 MHz — wrong band |
 | 5 | Antenna | 868 MHz, SMA-M or IPEX, λ/4 helical or stubby | 1 | $3 | must match LoRa module's connector |
-| 6 | BT keyboard | "M4" compact Bluetooth Classic (not BLE) | 1 | $15 | any BT keyboard whose name contains `M4`/`KB`/`HID`/`KEYBOARD`/`BT-KEY` |
+| 6 | BT keyboard | "M4" compact Bluetooth Classic (not BLE) | 1 | $15 | body reused as the pager case; any BT keyboard whose name contains `M4`/`KB`/`HID`/`KEYBOARD`/`BT-KEY` |
 | 7 | Piezo buzzer | passive, 3-5 V, 12 mm | 1 | $1 | **passive** — active buzzers generate their own tone and ignore PWM |
 | 8 | Series resistor | 100-220 Ω, 1/8 W | 1 | <$1 | limits buzzer current below GPIO's 16 mA |
-| 9 | LiPo battery | 2000 mAh, 3.7 V, JST-PH 2.0 | 1 | $7 | built-in protection circuit strongly recommended |
-| 10 | Boost converter | 3.7 V → 5 V, 1 A+ (CKCS or any TP4056 + boost combo) | 1 | $5 | with USB-C or micro-USB charge port if you want on-device charging |
-| 11 | Hookup wire | 28-30 AWG silicone, stranded | ~30 cm | <$1 | thin keeps the HAT profile flat |
-| 12 | Solder + flux | lead-free 0.5-0.8 mm, no-clean flux | — | — | — |
-| 13 | Case (optional) | 3D-printed, cardstock, or generic project box | 1 | — | screen + keyboard need a carry strap for kid use |
+| 9 | LiPo battery | 3.7 V, 2000 mAh, flat pouch (e.g. JL 505060) | 1 | $7 | built-in protection circuit recommended but not required — we add one externally |
+| 10 | **Charger + protection module** | **TP4056 + DW01A + FS8205A** (3-chip version with USB-C) | 1 | $2 | the "protected" variant — NOT the bare TP4056 breakout. Provides 1 A charge, undervoltage cutoff at 2.5 V, short-circuit protection |
+| 11 | Boost converter | 3.7 V → 5 V, 1 A+ (CKCS or similar) | 1 | $3 | takes TP4056 OUT+/OUT−, feeds Pi's 5 V rail |
+| 12 | Hookup wire | 28-30 AWG silicone, stranded | ~50 cm | <$1 | thin keeps the HAT profile flat |
+| 13 | Solder + flux | lead-free 0.5-0.8 mm, no-clean flux | — | — | — |
+| 14 | Case | 3D-printed or repurpose M4 body | 1 | — | the M4 keyboard body is big enough to host the battery and Pi internally |
 
 **Total per unit: ~$85. Pair: ~$170.**
+
+## Power topology
+
+One LiPo, one USB-C charge port (on the TP4056 module), feeds both the
+keyboard (directly, at 3.7 V) and the Pi (via boost to 5 V).
+
+```
+USB-C (on TP4056 module) ──→ TP4056 (1 A charge)
+                                │  +  DW01A undervoltage cutoff @ 2.5 V
+                                │  +  FS8205A short-circuit cutoff @ ~3 A
+                                │
+                        B+ / B− │ ───→ LiPo 3.7 V 2000 mAh
+                                │
+                     OUT+ / OUT−│ ───┬──→ M4 keyboard BAT+ / GND pads
+                                     │    (keyboard runs at 3.7 V directly)
+                                     │
+                                     └──→ CKCS boost IN ──→ 5 V ──→ Pi Zero
+                                                                     ├── E-Ink HAT
+                                                                     └── SX1276 LoRa
+```
+
+**Why the external charger.** The M4 keyboard has its own onboard charger
+(LP4068, SOT23-5) factory-tuned for its stock 300 mAh cell — `ISET` resistor
+sized for ~100 mA charge current. With our 2000 mAh cell and the Pi drawing
+~333 mA from the battery during use, the LP4068 could never keep up: the
+battery was always discharging while the pager was on, USB plugged in or
+not. Eventually the cell drifted into deep discharge and its internal BMS
+latched at 2.5 V (which kills the cell permanently if it sits latched for
+long). External TP4056 delivers 1 A (0.5 C for 2000 mAh — textbook),
+leaving +667 mA of net charge even with the pager fully active.
+
+The M4's LP4068 stays on its PCB but is no longer connected to the
+battery — its USB-C port is simply unused. All charging goes through the
+TP4056 module's USB-C.
 
 ## Tools
 
 - Soldering iron, 25-40 W, fine conical or chisel tip
 - Tweezers (SMD-style, pointy)
 - Wire stripper for 28-30 AWG
-- Multimeter (continuity mode, at minimum)
+- Multimeter (continuity mode — **verify LiPo polarity before connecting anything**)
 - Heat-shrink tubing, 1-2 mm
 - Tape (Kapton or electrical) to hold wires during soldering
 
@@ -100,19 +135,25 @@ output, the PA can be damaged in a few transmissions.
 GPIO13 supports hardware PWM via pigpio. Don't drive the buzzer from a
 software-PWM pin — it'll clock-glitch the E-Ink SPI during refresh.
 
-### Power
+### Power (TP4056 → LiPo → boost → Pi)
 
-LiPo → boost converter → Pi 5V rail.
+| Wire | From | To | Notes |
+|---|---|---|---|
+| 1 | TP4056 B+ | LiPo + (red) | battery to charger |
+| 2 | TP4056 B− | LiPo − (black) | battery ground |
+| 3 | TP4056 OUT+ | M4 keyboard BAT+ pad | keyboard powered direct from 3.7 V |
+| 4 | TP4056 OUT− | M4 keyboard GND pad | keyboard ground |
+| 5 | TP4056 OUT+ | boost IN+ | 3.7 V into boost |
+| 6 | TP4056 OUT− | boost IN− | boost ground |
+| 7 | boost OUT+ | Pi phys pin **2** or **4** (5V) | 5 V rail |
+| 8 | boost OUT− | Pi phys pin **6** (GND) | return |
 
-| Wire | From | To |
-|---|---|---|
-| 1 | LiPo + (red) | boost IN+ |
-| 2 | LiPo − (black) | boost IN− |
-| 3 | boost OUT+ (5V) | Pi phys pin **2** or **4** (5V) |
-| 4 | boost OUT− (GND) | Pi phys pin **6** or any GND |
+Wires 3+5 and 4+6 share the same TP4056 pads — solder both leads to the
+same pad, don't daisy-chain. Keep the OUT+ and OUT− runs as short as
+possible to avoid voltage drop under LoRa TX load.
 
-If the boost has an integrated charger (TP4056 + boost combo board), the
-charge input (USB-C / micro-USB) also becomes the charge-while-playing port.
+The M4 keyboard's own USB-C port is **not used** — don't plug anything
+into it. All charging goes through the TP4056 module's USB-C.
 
 ## Assembly order
 
@@ -130,16 +171,21 @@ charge input (USB-C / micro-USB) also becomes the charge-while-playing port.
    top — your soldered wires stick out the back side.
 6. **Connect the LoRa module.** Tape or hot-glue it to the underside of the
    Pi (the side without the HAT), antenna wire routed to a case exit.
-7. **Wire the battery** through the boost converter to the Pi's 5V rail.
-   Double-check polarity with a multimeter **before** plugging in — a
-   reversed LiPo kills the Pi instantly and may set fire to the battery.
-8. **Pair the M4 keyboard** over Bluetooth — see [README.md](README.md#bluetooth-keyboard-pairing).
-9. **Run diagnostics:**
-   ```bash
-   cd ~/kidpager && sudo python3 diagnose.py -y
-   ```
-   All checks should pass. The most common failure is `LoRa BUSY LOW after
-   reset` — 9/10 times it's a cold solder joint on GPIO 23 / phys pin 16.
+7. **Disconnect the M4's stock battery** (the original 300 mAh cell on the
+   keyboard PCB — snip its leads near the pouch, not at the pad).
+8. **Wire the battery through TP4056** as per the power table above.
+   **Double-check polarity with a multimeter** before any wire touches
+   the TP4056 — reversing the battery kills the DW01A on the spot and
+   may set fire to the cell.
+9. **Wire boost output to the Pi's 5V rail.** Again: meter-check polarity
+   and output voltage (~5.0-5.1 V) before plugging into the Pi.
+10. **Pair the M4 keyboard** over Bluetooth — see [README.md](README.md#bluetooth-keyboard-pairing).
+11. **Run diagnostics:**
+    ```bash
+    cd ~/kidpager && sudo python3 diagnose.py -y
+    ```
+    All checks should pass. The most common failure is `LoRa BUSY LOW after
+    reset` — 9/10 times it's a cold solder joint on GPIO 23 / phys pin 16.
 
 ## Power budget (rough)
 
@@ -151,16 +197,18 @@ set to `powersave`, ACT LED trigger off. See [power.py](power.py) and
 |---|---|---|
 | Pi idle (Wi-Fi off, powersave, ACT LED off) | ~60-70 mA | versus ~110-130 mA defaults |
 | Wi-Fi associated (Alt+W ON) | +40-60 mA | debug-only state |
-| E-Ink full refresh | ~20 mA × 2 s | full refresh every 20 frames |
+| E-Ink full refresh | ~20 mA × 2 s | full refresh every 20 frames, plus on sleep entry |
 | E-Ink partial refresh | ~10 mA × 0.3 s | the normal case |
 | LoRa RX listen | ~5 mA | continuous receive |
 | LoRa TX @ +22 dBm | ~120 mA × ~200 ms | per packet |
 | BT Classic HID link | ~10 mA | keyboard stays paired |
 | Buzzer @ 50% duty | ~15 mA × 60-120 ms | per beep |
 
-At a 2000 mAh LiPo with power-save active ≈ **18-20 hours** of mixed use
-(idle + occasional messages). With Wi-Fi left on for debug, back to ~12 h.
-Heavy TX load (dozens of messages/hour) adds 1-2 h of penalty.
+At a 2000 mAh LiPo with power-save active ≈ **5-6 hours** of mixed active
+use. Idle pager (in screen-saver, LoRa listening, no keyboard activity)
+extends significantly further. Charging while playing: TP4056's 1 A charge
+minus ~333 mA active draw = +667 mA net into the cell — full charge from
+empty in ~3 hours even with the pager running.
 
 ## Known gotchas
 
@@ -176,3 +224,11 @@ Heavy TX load (dozens of messages/hour) adds 1-2 h of penalty.
 - **pigpio on Bookworm** — the apt package was dropped. `deploy.ps1` builds
   it from source. Don't try `sudo apt install pigpio` — it won't work on
   Raspberry Pi OS Bookworm.
+- **TP4056 variant matters.** The bare TP4056 breakout (1 chip only) does
+  not disconnect the load at undervoltage — if you use that variant, a
+  stray discharge can kill the cell even though the software is fine.
+  The 3-chip version with DW01A + FS8205A is what this project expects.
+- **Don't power the M4's USB-C.** It still works as a charge input for the
+  now-disconnected LP4068, but there's nothing on the other side of the
+  LP4068 to charge. At best it does nothing; at worst a weird current
+  path into the Pi through the 3.7 V rail could upset the boost converter.

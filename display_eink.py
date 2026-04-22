@@ -6,30 +6,33 @@ The worker uses a single-slot "latest image wins" queue: if a new image
 is submitted while the worker is still drawing, the pending image is
 replaced - we never render a stale frame and the caller never waits.
 
-Layout (250x122):
-  [0..14]  header bar (inverted, 15px) -- name, badges, LoRa
-  [17..101] message area (6 lines * 14px) -- multi-line messages with wrap
-  [103]    separator
-  [105..121] input line
+Fonts (v0.14)
+-------------
+Previously: DejaVu Sans 12pt for everything. On a 250x122 1-bit panel
+the anti-aliased TrueType rendering rounded mid-pixels to black (1-bit
+has no grey), which made narrow pairs like 'ov' in "love" visually
+touch. Terminus is a bitmap font designed for exactly this case --
+every glyph is hand-pixelled for 1bpp output, no anti-aliasing rounding.
 
-Header badges, right-to-left:
-  LoRa / ----  always shown, far right
-  W            when Wi-Fi is ON (debug state)
-  M            when silent mode is ON
+Terminus is monospace. Header and small labels keep DejaVu (proportional
+spacing looks better for the sender name and status badges).
 
-Multi-line messages:
-  - Wrapped with word boundaries where possible, char-break for oversize words
-  - Timestamp right-aligned on the FIRST line of each message (small font)
-  - Continuation lines are indented by 2 spaces
+Emoji support: Terminus doesn't have emoji glyphs, neither does DejaVu
+Sans. We fall back to DejaVu Sans for any char outside the Terminus
+BMP range; missing glyphs render as Pillow's default "tofu" box which
+is visible but not useful. For v0.14 the user sees a placeholder for
+emoji on the E-Ink; the text still goes through and renders correctly
+on any device with a broader font. A future release can switch to a
+Unicode-wide bitmap font like GNU Unifont for real emoji on-device.
 
-Screens:
-  draw_chat         -- normal chat view
-  draw_profile      -- 4-item menu: Name / Channel / Silent / Back
-  draw_name_edit    -- text input for name
-  draw_channel_edit -- numeric picker for channel
-  draw_sleep        -- screen saver shown after idle timeout
+Cursor
+------
+A static underscore ``_`` is drawn immediately after the last character
+of the input buffer. Not mid-line -- the UI doesn't support caret
+motion in v0.14. We reserve pixel room for the cursor so tail-view
+trimming doesn't accidentally hide it.
 """
-import sys, time, threading
+import sys, time, threading, os
 import RPi.GPIO as GPIO
 sys.path.insert(0, "/home/pi")
 from PIL import Image, ImageDraw, ImageFont
@@ -51,34 +54,87 @@ BADGE_LORA_X = WIDTH - 32   # "LoRa" or "----"
 BADGE_WIFI_X = WIDTH - 45   # "W"
 BADGE_MUTE_X = WIDTH - 58   # "M"
 
+CURSOR = "_"
+
 _STATUS_SENDING = "~"
 
-try:
-    FONT = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-    FONT_SM = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-    FONT_BD = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
-    FONT_BIG = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-except Exception:
-    FONT = ImageFont.load_default()
-    FONT_SM = FONT
-    FONT_BD = FONT
-    FONT_BIG = FONT
+
+# --- Font loading -----------------------------------------------------------
+#
+# Strategy:
+#   1. Try Terminus in its canonical Debian path. Terminus ships as a
+#      PCF file for X/console plus a TTF conversion (fonts-terminus-otb
+#      on Bookworm) which Pillow can load.
+#   2. Fall back to DejaVu Sans if Terminus isn't installed. DejaVu is
+#      already a hard dependency (fonts-dejavu-core in deploy.ps1).
+#   3. Final fallback: Pillow's built-in default font (tiny bitmap).
+#
+# Sizes are picked for the 250x122 panel: 14 px body, 10 px small, 18
+# px bold header. Body 14 on Terminus = 7-px-wide monospace cells, so
+# 35 chars fit across 250 px minus margins.
+
+def _load_font(paths, size):
+    """Try each path in order, return the first one that loads. If
+    none load, return Pillow's default bitmap font."""
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+# Terminus body font for message text + input line. Try multiple names
+# because packaging differs across distros: fonts-terminus-otb (Debian
+# Bookworm), xfonts-terminus (older), Terminus on Arch, etc.
+_TERMINUS_CANDIDATES = [
+    "/usr/share/fonts/X11/misc/ter-u14n.otb",   # Debian fonts-terminus-otb
+    "/usr/share/fonts/X11/misc/ter-u16n.otb",
+    "/usr/share/fonts/terminus/TerminusTTF.ttf",
+    "/usr/share/fonts/truetype/terminus/TerminusTTF.ttf",
+]
+_DEJAVU_SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Body font for messages + input line. 14 px Terminus ~= 7 px per cell
+# so ~35 cols fit in (WIDTH - 4) px. Falls back to DejaVu 12 if
+# Terminus is absent.
+FONT = _load_font(_TERMINUS_CANDIDATES, 14)
+if isinstance(FONT, ImageFont.ImageFont):
+    # load_default() returns a bitmap; means Terminus failed AND
+    # truetype fallback didn't trigger. Try DejaVu explicitly at 12.
+    FONT = _load_font([_DEJAVU_SANS], 12)
+
+# Small font: 10 px for header badges and timestamps. Always DejaVu
+# because Terminus at 10 px is too pixelated for the tiny badges.
+FONT_SM = _load_font([_DEJAVU_SANS], 10)
+
+# Bold for header. DejaVu Bold looks better for the owner name.
+FONT_BD = _load_font([_DEJAVU_BOLD], 12)
+
+# Big bold for the sleep screen Zzz glyph.
+FONT_BIG = _load_font([_DEJAVU_BOLD], 36)
 
 
 def _relative_time(ts):
     diff = time.time() - ts
     if diff < 10:      return "now"
     elif diff < 60:    return f"{int(diff)}s"
-    elif diff < 3600:  return f"{int(diff/60)}m"
-    elif diff < 86400: return f"{int(diff/3600)}h"
-    else:              return f"{int(diff/86400)}d"
+    elif diff < 3600:  return f"{int(diff / 60)}m"
+    elif diff < 86400: return f"{int(diff / 3600)}h"
+    else:              return f"{int(diff / 86400)}d"
 
 
 def _text_width(font, s):
     try:
         return font.getlength(s)
     except Exception:
-        return font.getbbox(s)[2]
+        try:
+            return font.getbbox(s)[2]
+        except Exception:
+            # Fallback for bitmap default font
+            return len(s) * 6
 
 
 def _wrap_msg(prefix, text, font, first_max_w, max_w):
@@ -118,10 +174,7 @@ def _wrap_msg(prefix, text, font, first_max_w, max_w):
 
 
 def _build_message_lines(messages, font, font_sm, max_w):
-    """Flatten every visible message into a list of (line_text, ts_str) pairs.
-    ts_str is set only on the first line of each message (and only when the
-    line fits in first_line_max so the timestamp doesn't overlap the text).
-    Continuation lines get ts_str=None and a 2-space indent baked in."""
+    """Flatten every visible message into a list of (line_text, ts_str) pairs."""
     rendered = []
     for msg in messages:
         ts_str = _relative_time(msg.timestamp)
@@ -137,8 +190,6 @@ def _build_message_lines(messages, font, font_sm, max_w):
 
         first_line_max = max_w - ts_w
         if first_line_max < 40:
-            # Not enough room for a timestamp without clobbering the message;
-            # drop the timestamp and use the full width for text.
             wrapped = _wrap_msg(prefix, msg.text, font, max_w, max_w)
             rendered.append((wrapped[0], None))
         else:
@@ -170,8 +221,6 @@ from waveshare_epd import epd2in13_V4 as epd_driver
 
 
 def _draw_header(d, name, lora_on=False, wifi_on=False, silent=False):
-    """Common header: inverted bar with name on the left, LoRa/W/M badges
-    on the right."""
     d.rectangle([0, 0, WIDTH, HEADER_H - 1], fill=0)
     d.text((3, 1), name, font=FONT_BD, fill=255)
     if silent:
@@ -190,13 +239,17 @@ class EInkDisplay:
         self.first_draw = True
         self.updates = 0
         self._pending = None
+        self._pending_force_full = False
         self._lock = threading.Lock()
         self._hw_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = False
         self._thread = threading.Thread(target=self._worker, daemon=True, name="eink-worker")
         self._thread.start()
-        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker)")
+        # Log which body font we ended up with so journalctl shows
+        # whether Terminus was found or we fell back.
+        font_name = getattr(FONT, "path", "<bitmap default>")
+        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker) font={os.path.basename(str(font_name))}")
 
     def draw_chat(self, name, channel, messages, input_text,
                   lora_on=False, wifi_on=False, silent=False):
@@ -204,7 +257,7 @@ class EInkDisplay:
         d = ImageDraw.Draw(img)
         _draw_header(d, name, lora_on=lora_on, wifi_on=wifi_on, silent=silent)
 
-        # Messages (multi-line, timestamped)
+        # Messages
         usable_w = WIDTH - 4
         all_lines = _build_message_lines(messages, FONT, FONT_SM, usable_w)
         visible = all_lines[-MAX_MSG_LINES:]
@@ -216,28 +269,41 @@ class EInkDisplay:
                 d.text((ts_x, y + 1), ts_str, font=FONT_SM, fill=0)
             y += LINE_H
 
-        # Input line with tail-view (drop leading chars if input overflows)
+        # Input line with tail-view (drop leading chars if input overflows).
+        # Reserve pixel room for the cursor so it's always visible at the
+        # tail of whatever we drew.
         d.line([(0, SEPARATOR_Y), (WIDTH, SEPARATOR_Y)], fill=0)
-        cursor_str = f"> {input_text}"
-        if _text_width(FONT, cursor_str) <= usable_w:
-            visible_inp = cursor_str
+        cursor_w = _text_width(FONT, CURSOR)
+        budget = usable_w - cursor_w
+        prefix = "> "
+        prefix_w = _text_width(FONT, prefix)
+        text_budget = budget - prefix_w
+        if _text_width(FONT, input_text) <= text_budget:
+            visible_inp = input_text
+            trim_marker = ""
         else:
+            # Drop leading chars until the tail fits
             tail = input_text
-            while tail and _text_width(FONT, f"> {tail}") > usable_w - 4:
+            while tail and _text_width(FONT, tail) > text_budget - _text_width(FONT, "."):
                 tail = tail[1:]
-            visible_inp = f">.{tail}"
-        d.text((3, INPUT_TOP), visible_inp, font=FONT, fill=0)
+            visible_inp = tail
+            trim_marker = "."
+        d.text((3, INPUT_TOP), prefix, font=FONT, fill=0)
+        x_after_prefix = 3 + prefix_w
+        if trim_marker:
+            d.text((x_after_prefix, INPUT_TOP), trim_marker, font=FONT, fill=0)
+            x_after_prefix += _text_width(FONT, trim_marker)
+        d.text((x_after_prefix, INPUT_TOP), visible_inp, font=FONT, fill=0)
+        cursor_x = x_after_prefix + _text_width(FONT, visible_inp)
+        d.text((cursor_x, INPUT_TOP), CURSOR, font=FONT, fill=0)
 
         self._submit(img)
 
     def draw_profile(self, name, channel, silent, selection):
-        """Render the 4-item profile menu. `silent` is the current state of
-        the silent-mode toggle, shown on the third line as ON/OFF."""
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, WIDTH, HEADER_H - 1], fill=0)
         d.text((3, 1), "PROFILE", font=FONT_BD, fill=255)
-
         silent_label = f"Silent: {'ON' if silent else 'OFF'}"
         items = [
             f"Name: {name}",
@@ -245,8 +311,6 @@ class EInkDisplay:
             silent_label,
             "Back to chat",
         ]
-
-        # 4 items fit in 96 px: y = 22, 44, 66, 88 at 22 px spacing.
         y = 22
         row_h = 22
         for i, item in enumerate(items):
@@ -259,6 +323,8 @@ class EInkDisplay:
         self._submit(img)
 
     def draw_name_edit(self, name):
+        """Name editor. Same cursor treatment as the chat input line --
+        draw the buffer, then an underscore immediately after."""
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, WIDTH, HEADER_H - 1], fill=0)
@@ -266,6 +332,12 @@ class EInkDisplay:
         d.text((10, 42), "Name:", font=FONT, fill=0)
         d.rectangle([10, 60, WIDTH - 10, 78], outline=0)
         d.text((14, 62), name, font=FONT, fill=0)
+        cursor_x = 14 + _text_width(FONT, name)
+        # Clamp so the cursor doesn't spill past the box
+        max_x = WIDTH - 10 - _text_width(FONT, CURSOR) - 2
+        if cursor_x > max_x:
+            cursor_x = max_x
+        d.text((cursor_x, 62), CURSOR, font=FONT, fill=0)
         self._submit(img)
 
     def draw_channel_edit(self, channel):
@@ -281,39 +353,26 @@ class EInkDisplay:
         self._submit(img)
 
     def draw_sleep(self, name, silent=False):
-        """Screen saver shown after IDLE_TIMEOUT of inactivity. Minimal
-        drawing to reduce E-Ink wear: big 'Zzz' top-centered, owner name
-        below, tiny hint at the bottom. A muted badge is shown bottom-right
-        if silent mode is on, so the user knows alarms won't sound."""
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
-
-        # Big "Zzz"
         zzz = "Zzz"
         zw = _text_width(FONT_BIG, zzz)
         d.text(((WIDTH - zw) // 2, 6), zzz, font=FONT_BIG, fill=0)
-
-        # Name
         nw = _text_width(FONT_BD, name)
         d.text(((WIDTH - nw) // 2, 60), name, font=FONT_BD, fill=0)
-
-        # Hint
         hint = "Press any key"
         hw = _text_width(FONT_SM, hint)
         d.text(((WIDTH - hw) // 2, 88), hint, font=FONT_SM, fill=0)
-
-        # Mute badge bottom-right so the kid knows whether they'll hear the
-        # next incoming message. Silent = quiet icon in the corner; not
-        # silent = nothing (default awake behavior).
         if silent:
             d.text((WIDTH - 44, 104), "(muted)", font=FONT_SM, fill=0)
-
-        self._submit(img)
+        self._submit(img, force_full=True)
 
     # ---------- worker plumbing ----------
-    def _submit(self, img):
+    def _submit(self, img, force_full=False):
         with self._lock:
             self._pending = img
+            if force_full:
+                self._pending_force_full = True
         self._wake.set()
 
     def _worker(self):
@@ -323,33 +382,41 @@ class EInkDisplay:
             while not self._stop:
                 with self._lock:
                     img = self._pending
+                    force_full = self._pending_force_full
                     self._pending = None
+                    self._pending_force_full = False
                 if img is None:
                     break
                 try:
                     with self._hw_lock:
-                        self._render(img)
+                        self._render(img, force_full=force_full)
                 except Exception as e:
                     print(f"E-Ink worker error: {e}")
 
-    def _render(self, img):
+    def _render(self, img, force_full=False):
         buf = self.epd.getbuffer(img)
         if self.first_draw:
             self.epd.display(buf)
             self.first_draw = False
             self.updates = 0
+            return
+        if force_full:
+            self.epd.init()
+            self.epd.display(buf)
+            self.updates = 0
+            return
+        self.updates += 1
+        if self.updates >= 20:
+            self.epd.init()
+            self.epd.display(buf)
+            self.updates = 0
         else:
-            self.updates += 1
-            if self.updates >= 20:
-                self.epd.init()
-                self.epd.display(buf)
-                self.updates = 0
-            else:
-                self.epd.displayPartial(buf)
+            self.epd.displayPartial(buf)
 
     def clear(self):
         with self._lock:
             self._pending = None
+            self._pending_force_full = False
         with self._hw_lock:
             self.epd.init()
             self.epd.Clear(0xFF)

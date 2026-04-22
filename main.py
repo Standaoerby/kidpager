@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
 """KidPager - LoRa messenger for kids.
 
+Event loop
+----------
+The main loop is a standard asyncio ``while True`` with a short sleep.
+Keyboard events are produced by a background thread in ``keyboard.py``
+into a ``deque`` -- we drain as many as are ready per tick (up to
+``KB_DRAIN_MAX``) with no syscall cost when the queue is empty. This
+decouples input capture from E-Ink refresh: the worker thread keeps
+filling the queue even during a ~2 s full panel refresh, and on the
+next tick the whole burst is processed in one batch.
+
 E-Ink refresh strategy
 ----------------------
-E-Ink hardware refreshes are slow (~300 ms partial, ~2 s full) and wear out
-the panel if done too often. We balance responsiveness against cost with a
-two-pronged debounce:
+E-Ink hardware refreshes are slow (~300 ms partial, ~2 s full) and wear
+out the panel. Two-pronged debounce while typing:
 
-  TYPING_SETTLE     After the last keypress, wait this long before redrawing.
-                    Catches the common case: user types "hello", pauses, we
-                    redraw once instead of six times.
-  TYPING_MAX_STALE  During *continuous* typing the settle timer never fires
-                    (last_key keeps moving). This is a cap: we still redraw
-                    at least every TYPING_MAX_STALE seconds so the user sees
-                    what they're typing even when they don't pause.
+  TYPING_SETTLE     after the last keypress, wait this long before
+                    redrawing. Catches the common case: user types
+                    "hello", pauses, we redraw once.
+  TYPING_MAX_STALE  during CONTINUOUS typing the settle timer never
+                    fires; this is the cap that guarantees the user
+                    sees their input at least every N seconds.
 
-Non-typing events (incoming message, ack received, profile navigation, send)
-bypass debounce and trigger an immediate full_redraw() -- they're rare and
-the user wants to see the result now.
+Non-typing events (incoming message, ack, profile navigation, send,
+wifi toggle, silent toggle, wake) bypass debounce and redraw now.
 
 Sleep / screen-saver
 --------------------
-After IDLE_TIMEOUT seconds without *any* activity (key or incoming message),
-the UI enters the "sleep" state and shows a minimal screen saver. Any key
-wakes it back into chat. An incoming message also wakes it, but with a
-louder rising alarm (beep_alarm instead of beep_incoming). Silent mode
-mutes all tones regardless of state.
+After IDLE_TIMEOUT seconds with no key and no incoming message, the UI
+enters sleep. Any key wakes; incoming message also wakes and plays
+``beep_alarm`` instead of ``beep_incoming``. Silent mode mutes all.
+
+Auto-sleep is suppressed while Wi-Fi is on -- Wi-Fi on = live SSH
+session = don't ambush the user with a full-refresh flash mid-debug.
 """
 import asyncio, os, sys, time
 from config import Config
@@ -41,7 +49,14 @@ TYPING_SETTLE = 0.3
 TYPING_MAX_STALE = 1.5
 KB_CHECK_INTERVAL = 5
 ACK_CHECK_INTERVAL = 2
-IDLE_TIMEOUT = 300   # 5 minutes -- idle time before entering sleep screen
+IDLE_TIMEOUT = 300   # 5 minutes
+
+# Drain up to this many queued keys per tick. The background reader
+# can queue a full 256-deep buffer while we're off doing E-Ink, so on
+# the next tick we might need to process a big batch. Higher than 20
+# (v0.13) because a paste or fast burst easily exceeds 20 and we
+# don't want to carry leftover events across multiple ticks.
+KB_DRAIN_MAX = 128
 
 
 async def main():
@@ -58,7 +73,6 @@ async def main():
     lora_ok = lora.init()
 
     buzzer = Buzzer()
-    # Apply persisted silent preference before the first beep can fire.
     buzzer.set_silent(config.silent)
 
     ui = PagerUI(config, lora if lora_ok else None)
@@ -66,32 +80,53 @@ async def main():
     print("\nReady! Enter=send Esc=menu Alt+W=wifi\n")
     ui.full_redraw()
 
-    last_key = 0
+    last_key = 0.0
     eink_pending = False
     last_eink_draw = time.time()
     last_kb_check = time.time()
     last_ack_check = time.time()
     last_flush = time.time()
-    # Any user input OR incoming message resets this. When now - last_activity
-    # exceeds IDLE_TIMEOUT in chat state, we drop into the screen saver.
     last_activity = time.time()
+
+    # Dropped-keys monitoring. If the background reader ever overflows
+    # its deque we print a warning so journalctl shows the problem.
+    last_dropped = 0
 
     try:
         while True:
-            got_key = False
+            got_typing = False  # a printable character was added
             action = None
 
-            for _ in range(20):
-                key = kb.read_key_sync()
-                if key is None: break
-                got_key = True
+            # Drain the keyboard queue. The reader thread keeps
+            # producing during our other work; this loop only runs
+            # briefly each tick.
+            drained = 0
+            while drained < KB_DRAIN_MAX:
+                key = kb.poll()
+                if key is None:
+                    break
+                drained += 1
                 last_key = time.time()
-                last_activity = last_key     # any key = activity
+                last_activity = last_key
                 a = ui.handle_key(key)
-                if   a == "send":            action = "send"
-                elif a == "toggle_wifi":     action = "toggle_wifi"
-                elif a == "silent_changed":  action = "silent_changed"
-                elif a == "wake":            action = "wake"
+                if a == "send":           action = "send"
+                elif a == "toggle_wifi":  action = "toggle_wifi"
+                elif a == "silent_changed": action = "silent_changed"
+                elif a == "wake":         action = "wake"
+                else:
+                    # Any None return from a printable key in chat is
+                    # "typing in progress" -- flag so we schedule a
+                    # redraw via the debounce path.
+                    if isinstance(key, str) and len(key) == 1:
+                        got_typing = True
+
+            # Dropped-key diagnostics
+            dropped_now = kb.dropped()
+            if dropped_now != last_dropped:
+                delta = dropped_now - last_dropped
+                last_dropped = dropped_now
+                print(f"WARNING: kb dropped {delta} events "
+                      f"(total {dropped_now}) -- main loop starved")
 
             if action == "send":
                 msg = ui.get_message()
@@ -111,21 +146,16 @@ async def main():
                 eink_pending = False
                 last_eink_draw = time.time()
             elif action == "silent_changed":
-                # ui already persisted + redrew the profile menu. We just need
-                # to mirror the new setting into the buzzer so the next beep
-                # respects it.
                 buzzer.set_silent(config.silent)
-                # No beep here -- toggling silent shouldn't make a sound either
-                # way (it would be confusing when turning silent ON).
                 eink_pending = False
                 last_eink_draw = time.time()
             elif action == "wake":
-                # User hit a key while asleep; ui already transitioned to chat
-                # and redrew. Just record that we're active again and skip the
-                # typing-debounce path.
                 eink_pending = False
                 last_eink_draw = time.time()
-            elif got_key:
+            elif got_typing:
+                # At least one printable char landed this tick.
+                # Schedule a debounced redraw; also nudge the TTY line
+                # so SSH sessions see the input immediately (cheap).
                 ui.term_input_line()
                 eink_pending = True
 
@@ -152,14 +182,11 @@ async def main():
                     rtype, data = result
                     if rtype == "msg":
                         sender, text, msg_id = data
-                        # Always ack, even duplicates -- lost-ack recovery needs it.
                         lora.send_ack(msg_id)
                         is_new = ui.add_message(sender, text, outgoing=False, msg_id=msg_id)
                         if is_new:
                             last_activity = time.time()
                             if ui.state == "sleep":
-                                # Wake + louder rising alarm. Buzzer itself
-                                # handles silent-mode muting.
                                 ui.wake()
                                 asyncio.create_task(buzzer.beep_alarm())
                             else:
@@ -169,9 +196,6 @@ async def main():
                     elif rtype == "ack":
                         if ui.mark_delivered(data):
                             asyncio.create_task(buzzer.beep_ack())
-                            # Skip redraw if asleep -- ack isn't worth waking
-                            # the screen for, and we don't want the sleep
-                            # page repainted with partial refresh.
                             if ui.state != "sleep":
                                 ui.full_redraw()
                                 last_eink_draw = time.time()
@@ -183,7 +207,6 @@ async def main():
                     after = sum(1 for m in ui.messages if m.status == STATUS_FAIL)
                     if after > before:
                         asyncio.create_task(buzzer.beep_error())
-                    # Same idea as above: if asleep, keep the sleep screen.
                     if ui.state != "sleep":
                         ui.full_redraw()
                         last_eink_draw = time.time()
@@ -192,13 +215,14 @@ async def main():
                 last_flush = now
                 ui.flush_history()
 
-            # Auto-sleep: only from chat state, so we don't clobber a user who
-            # left the profile menu open for 5 minutes.
+            # Auto-sleep: chat state + Wi-Fi off + idle timeout.
+            # Wi-Fi on means an SSH session is in progress; don't
+            # ambush the user with the full-refresh sleep flash.
             if (ui.state == "chat"
+                    and not ui.wifi_on
                     and (now - last_activity) > IDLE_TIMEOUT):
                 ui.enter_sleep()
                 last_eink_draw = time.time()
-                # Reset so we don't re-enter sleep every tick.
                 last_activity = now
 
             await asyncio.sleep(0.01)
