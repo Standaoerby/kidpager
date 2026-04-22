@@ -3,6 +3,18 @@
 ## v0.14 — 2026-04-22
 
 ### Fixed
+- **Alt+W toggled the badge but Wi-Fi stayed down.** On Trixie, NetworkManager
+  keeps its own `radio wifi on/off` state separate from kernel rfkill. When
+  `kidpager-power.service` blocks Wi-Fi via rfkill at boot, NM observes the
+  blocked state and disables its internal radio; later clearing rfkill alone
+  (the old `power.wifi_toggle`) did not tell NM to re-enable, so the pager
+  silently stayed offline — the `W` badge flipped, but the Pi never got a
+  DHCP lease. `power.wifi_toggle` now drives rfkill AND nmcli in lockstep:
+  unblock + `nmcli radio wifi on` + `nmcli device connect wlan0` on toggle-on,
+  `nmcli radio wifi off` + block on toggle-off. The symptom before the fix
+  was "pager boots, LoRa works, `W` badge shows after Alt+W, but no SSH and
+  no `.local` resolve" — which is what we spent an afternoon debugging on a
+  freshly flashed pager.
 - **Terminus font was never actually used.** The font loader in
   `display_eink.py` used `isinstance(FONT, ImageFont.ImageFont)` to
   decide whether to fall back from Terminus to DejaVu. That check is
@@ -110,27 +122,8 @@
   which is needless E-Ink wear. Caret movement into the middle of
   the input buffer is **not** supported in v0.14 (LEFT/RIGHT remain
   menu/scroll keys); use backspace to edit mid-line.
-- **Emoji shortcuts in the input buffer.** 15 common text-face
-  sequences get replaced on-the-fly with Unicode emoji: `:)` `:(`
-  `:D` `:P` `:O` `;)` `<3` `:|` `:*` `xD` `XD` `:'(` `^_^` `o_O` `O_o`.
-  Replacement happens at the trailing edge after each printable key,
-  so the E-Ink view shows the final character as the user types.
-  `get_message()` also runs a full-buffer expansion at send time so
-  shortcuts the user typed past without pausing still reach the air.
-  The emoji travel as plain UTF-8 in the existing LoRa payload — no
-  protocol change, no compat break. Backspace on an emoji with a
-  Unicode variation selector (e.g. ❤️ = heart + VS16) deletes the
-  full visible glyph in one press.
 
 ### Changed
-- **Emoji shortcut lookup is ~10x faster on the typical non-matching
-  path.** `apply_emoji_shortcuts` was iterating all 15 sequences with
-  `endswith` on every keystroke. Most keys don't land on a shortcut
-  trigger at all (letters, digits, space). Now pre-indexed by the
-  last character of each sequence (`_EMOJI_BY_LAST`); a single dict
-  lookup rejects non-trigger keystrokes in ~0.1 µs instead of running
-  15 `endswith` checks at ~1 µs. Matching behavior is identical
-  (longest-first within each bucket, trailing-only match).
 - **`main.py` drain loop no longer stamps `time.time()` per key.**
   A 128-key burst was calling `time.time()` 128 times; hoisted to
   once per tick. All keys in a single ~10 ms drain belong to the
@@ -149,18 +142,14 @@
   `got_typing` flag — only printable characters trigger a debounced
   redraw, modifier-only events don't reset the settle timer.
 - **`display_eink.py` font loader.** `_load_font(paths, size)` tries
-  a list of candidates in order; Terminus canonical Debian Bookworm
-  paths checked first, then DejaVu, then Pillow's bitmap default.
-  Cursor rendering reserves pixel width before tail-view trimming so
-  it is always visible at the input line's right edge.
-- **`ui.py` emoji table.** Sorted longest-first at module load so
-  `:'(` matches before `:(` and `XD` before `X`. `apply_emoji_shortcuts`
-  (trailing-only) runs on every printable keystroke;
-  `expand_emoji_in_full` (global) runs inside `get_message()`.
+  a list of candidates in order; Debian Trixie's Terminus path
+  (`/usr/share/fonts/opentype/terminus/terminus-normal.otb`) is checked
+  first with the Bookworm path (`/usr/share/fonts/X11/misc/ter-u14n.otb`)
+  as fallback, then DejaVu, then Pillow's bitmap default. Cursor
+  rendering reserves pixel width before tail-view trimming so it is
+  always visible at the input line's right edge.
 
 ### Unchanged (verified during release check)
-- All 15 emoji shortcuts expand correctly in unit tests, including
-  trailing-only + full-expand + backspace-over-VS16 edge cases.
 - Sleep → wake → chat transition still works; `wifi_on` gate on
   auto-sleep from v0.13 unchanged.
 - E-Ink worker thread + "latest image wins" queue unchanged —

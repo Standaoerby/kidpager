@@ -94,6 +94,8 @@ alarm pattern (silent mode mutes it).
 Auto-sleep is suppressed while Wi-Fi is on, so an SSH session isn't
 interrupted mid-command by a full-refresh flash.
 
+## Radio
+
 LoRa: 868 MHz, SF 9, BW 125 kHz, CR 4/5, sync word 0x1424 (private network),
 TX power 22 dBm. Packet format: `"KPG" | channel | type | payload`, with
 `type` = 0x01 (message) or 0x02 (ack).
@@ -105,7 +107,7 @@ Windows side, from the project folder:
 ```powershell
 .\deploy.ps1 -Setup            # once — sets up SSH keys to both pagers
 .\deploy.ps1 -All               # push code, install pigpio, enable service
-.\deploy.ps1 -PiHost kidpager.local   # push to one device
+.\deploy.ps1 -PiHost kp3.local   # push to one device
 .\deploy.ps1 -Restart           # restart service on both
 .\deploy.ps1 -WipeHistory       # clear chat history on both
 .\deploy.ps1 -Diag              # run diagnose.py on both
@@ -145,7 +147,7 @@ cd ~/kidpager && sudo python3 diagnose.py -y
 Remotely from Windows (runs on both pagers, prints per-device summary):
 ```powershell
 .\deploy.ps1 -Diag                          # both pagers
-.\deploy.ps1 -Diag -PiHost kidpager.local   # one pager
+.\deploy.ps1 -Diag -PiHost kp3.local   # one pager
 ```
 
 Exit code 0 if everything healthy, 1 if any failure. Flags:

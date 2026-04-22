@@ -4,13 +4,13 @@
 #   .\deploy.ps1 -Help                              # show this usage block
 #   .\deploy.ps1 -Setup                             # install SSH key on both pagers (no code push)
 #   .\deploy.ps1 -All                               # deploy to both pagers (auto-installs key if missing)
-#   .\deploy.ps1 -PiHost kidpager.local             # deploy to one pager
+#   .\deploy.ps1 -PiHost kp3.local             # deploy to one pager
 #   .\deploy.ps1 -Restart                           # restart kidpager.service on both
 #   .\deploy.ps1 -WipeHistory                       # clear chat history on both
 #   .\deploy.ps1 -All -WipeHistory                  # deploy then wipe
 #   .\deploy.ps1 -All -Tests                        # deploy + also copy test_*.py
 #   .\deploy.ps1 -Diag                              # run full diagnose.py on both
-#   .\deploy.ps1 -Diag -PiHost kidpager.local       # diagnose one pager
+#   .\deploy.ps1 -Diag -PiHost kp3.local       # diagnose one pager
 #
 # Target OS: Raspberry Pi OS Trixie Lite (Python 3.13) on Pi Zero 2 W.
 #
@@ -28,7 +28,7 @@
 # Pre-requisites (set in rpi-imager BEFORE flashing -- saves half a day of
 # post-boot fiddling):
 #
-#   * Hostname            kidpager   (or kidpager2 for the second device)
+#   * Hostname            kp2   (or kp3 for the second device)
 #   * SSH                 enabled
 #   * Wi-Fi               SSID + password (no ethernet on Pi Zero 2 W)
 #   * Username            pi
@@ -38,7 +38,7 @@
 #
 # Forgot passwordless sudo? The script detects it and shows the fix. You
 # can also pre-apply manually:
-#   ssh -t pi@kidpager.local
+#   ssh -t pi@kp3.local
 #   echo 'pi ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/010_pi-nopasswd
 #   sudo chmod 0440 /etc/sudoers.d/010_pi-nopasswd
 #   sudo visudo -c
@@ -56,20 +56,44 @@ param(
     [switch]$Help
 )
 
+# Sync .NET current directory with the script's directory. Windows
+# PowerShell 5.1 Set-Location only updates the PS $PWD; .NET file APIs
+# ([System.IO.File]::ReadAllBytes / WriteAllBytes, used in step [4/8]
+# to copy .py files) keep using the process launch cwd. Invoking
+# `.\deploy.ps1` from a random shell cwd would leave them looking in
+# that cwd and silently failing to find files, while the subsequent
+# verify step reports [OK] because the prior deploy's files are still
+# on the pager. Forcing both cwds to $PSScriptRoot makes the copy
+# step robust regardless of where the caller is standing.
+if ($PSScriptRoot) {
+    Set-Location $PSScriptRoot
+    [System.IO.Directory]::SetCurrentDirectory($PSScriptRoot)
+}
+
 # ===========================================================================
 # Constants
 # ===========================================================================
-$PAGERS = @("kidpager.local", "kidpager2.local")
+$PAGERS = @("kp2.local", "kp3.local")
 $KEY = "$env:USERPROFILE\.ssh\id_kidpager"
 
 # SSH options for already-authorized connections. Hostkey/known-hosts checks
 # off: we re-authenticate by key every time, MITM risk on a LAN is no higher
 # than we already accept, and this survives SD-card re-flashes without
 # manual ssh-keygen -R cleanup.
+#
+# ConnectTimeout=15 + ConnectionAttempts=3: Pi Zero 2 W's Wi-Fi is flaky
+# under load (ping RTT can spike past 800 ms), and a 5 s timeout was
+# triggering false-negative Test-PasswordlessSudo / Test-PasswordlessSSH
+# mid-deploy, which routed us into the password-install path or aborted
+# with a bogus "passwordless sudo NOT configured" message. A responsive
+# pager still answers in <1 s; these values only kick in when the link
+# hiccups.
 $sshCmd = @(
     "-F", "nul",
     "-i", $KEY,
-    "-o", "ConnectTimeout=5",
+    "-o", "ConnectTimeout=15",
+    "-o", "ConnectionAttempts=3",
+    "-o", "ServerAliveInterval=5",
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "LogLevel=ERROR"
@@ -96,13 +120,13 @@ Usage:
   .\deploy.ps1 -Help                          show this help
   .\deploy.ps1 -Setup                         install SSH key on both pagers (no code push)
   .\deploy.ps1 -All                           deploy to both pagers (auto-installs key)
-  .\deploy.ps1 -PiHost kidpager.local         deploy to one pager
+  .\deploy.ps1 -PiHost kp3.local         deploy to one pager
   .\deploy.ps1 -Restart                       restart kidpager.service on both
   .\deploy.ps1 -WipeHistory                   clear chat history on both
   .\deploy.ps1 -All -WipeHistory              deploy then wipe
   .\deploy.ps1 -All -Tests                    deploy + also copy test_*.py
   .\deploy.ps1 -Diag                          run full diagnose.py on both
-  .\deploy.ps1 -Diag -PiHost kidpager.local   diagnose one pager
+  .\deploy.ps1 -Diag -PiHost kp3.local   diagnose one pager
 
 Flags:
   -PiUser <name>   override SSH user (default: pi)
@@ -184,8 +208,14 @@ function Resolve-Target {
     # MAC prefixes. This is best-effort: if >1 Pi is on the LAN we
     # can't tell which one is $HostName, so we return the first match
     # and trust the caller to verify via the subsequent SSH probe.
+    #
+    # 88-a2-9e is the OUI observed on our actual Pi Zero 2 W pagers
+    # (originally assigned to Compal Broadband, but reused by recent
+    # RPi Trading batches); without it this ARP fallback never fires
+    # for our own hardware. The older d8-3a-dd/b8-27-eb/dc-a6-32/etc.
+    # stay in the list for older Pi models on the same LAN.
     try {
-        $pi_prefixes = @('d8-3a-dd', 'b8-27-eb', 'dc-a6-32', '28-cd-c1', 'e4-5f-01')
+        $pi_prefixes = @('88-a2-9e', 'd8-3a-dd', 'b8-27-eb', 'dc-a6-32', '28-cd-c1', 'e4-5f-01')
         $arpOut = & arp -a 2>$null
         foreach ($line in $arpOut) {
             foreach ($p in $pi_prefixes) {
@@ -205,6 +235,12 @@ function Resolve-Target {
 # connectivity fails, returns $false.
 function Test-PasswordlessSSH {
     param([string]$Target)
+    # Pi Zero 2 W's Wi-Fi is flaky under load -- a single slow RTT can push
+    # the SSH handshake past ConnectTimeout=5 and give a false negative,
+    # which then routes us into Install-SSHKey and a password prompt in
+    # the middle of deploy. ConnectTimeout=15 + ConnectionAttempts=3
+    # smooths over transient dropouts without lengthening the happy path
+    # (a responsive pager still answers in <1 s).
     $result = & ssh -F nul `
         -i $KEY `
         -o BatchMode=yes `
@@ -212,7 +248,9 @@ function Test-PasswordlessSSH {
         -o StrictHostKeyChecking=no `
         -o UserKnownHostsFile=/dev/null `
         -o LogLevel=ERROR `
-        -o ConnectTimeout=5 `
+        -o ConnectTimeout=15 `
+        -o ConnectionAttempts=3 `
+        -o ServerAliveInterval=5 `
         $Target "echo ok" 2>$null
     # Check both stdout AND exit code so a transient 0-exit connection drop
     # doesn't falsely report success without the remote having acknowledged.
@@ -283,9 +321,35 @@ function Ensure-Connectivity {
         Write-Host "  $HostName SSH key installed" -ForegroundColor Green
     }
 
+    # Catch stale mDNS/DNS that maps `kp3.local` to the IP of a
+    # DIFFERENT Pi (typically kp2) while the real target is offline.
+    # Without this check the deploy writes silently to the wrong pager
+    # and the [8/8] verify step still reports [OK] because prior deploys
+    # populated the fake-target with the same files. Only runs when the
+    # user passed a hostname (skipping for explicit IPs is intentional:
+    # if you asked for an IP, you know which device you're hitting).
+    # Runs BEFORE the sudo check so a stale-DNS situation surfaces as a
+    # HOSTNAME MISMATCH error rather than a misleading "sudo NOT configured"
+    # (the latter would point the user at fixing the wrong device).
+    if ($HostName -match '\.local$') {
+        $expected = $HostName -replace '\.local$', ''
+        $actualRaw = & ssh @sshCmd $target "hostname" 2>$null
+        $actual = if ($actualRaw) { $actualRaw.ToString().Trim() } else { "" }
+        if ($actual -and $actual -ne $expected) {
+            Write-Host "  $HostName -> $ip  HOSTNAME MISMATCH: remote reports '$actual' (expected '$expected')" -ForegroundColor Red
+            Write-Host "  -> stale DNS/mDNS cache routing to the wrong Pi; the real '$HostName' is offline." -ForegroundColor Yellow
+            Write-Host "  -> fix: ipconfig /flushdns, then power on / Alt+W on the real pager, or use -PiHost <ip>" -ForegroundColor Yellow
+            return $null
+        }
+    }
+
     if (-not (Test-PasswordlessSudo $target)) {
         Write-Host "  $HostName passwordless sudo NOT configured -- deploy will hang on sudo prompts" -ForegroundColor Red
-        Write-Host "  Fix:  ssh -t pi@$HostName 'echo `"pi ALL=(ALL) NOPASSWD:ALL`" | sudo tee /etc/sudoers.d/010_pi-nopasswd && sudo chmod 0440 /etc/sudoers.d/010_pi-nopasswd'" -ForegroundColor Yellow
+        # Quoting: outer double, inner single — PowerShell's native-arg
+        # quoting strips embedded `"`, which is why the obvious `'echo
+        # "..." | ...'` form silently turns `(ALL)` into a bash syntax
+        # error at paste time.
+        Write-Host "  Fix:  ssh -t pi@$HostName `"echo 'pi ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/010_pi-nopasswd && sudo chmod 0440 /etc/sudoers.d/010_pi-nopasswd`"" -ForegroundColor Yellow
         return $null
     }
 
@@ -399,7 +463,7 @@ foreach ($dest in $targets) {
     #     "love" letter-merging bug). Try otb first, then xfonts-terminus.
     #     If both are unavailable, display_eink.py falls back to DejaVu at
     #     runtime so the pager still works, just with v0.13 rendering.
-    #   * avahi-daemon: mDNS publisher so kidpager.local / kidpager2.local
+    #   * avahi-daemon: mDNS publisher so kp3.local / kp2.local
     #     resolve from Windows. Trixie Lite ships without it by default; a
     #     first-deploy-by-IP is what bootstraps subsequent deploy-by-name.
     #   * git + build-essential: needed to build pigpiod from source in [2/8]
@@ -558,10 +622,17 @@ else
     sudo systemctl status pigpiod --no-pager -n 5 2>/dev/null | head -10 | sed 's/^/    /'
 fi
 
-# End-to-end check via heredoc so we never need a `"` inside bash. The
-# quoted marker <<'PYEOF' tells bash NOT to interpolate shell vars
-# inside the heredoc, so Python sees the code exactly as written.
-python3 2>&1 <<'PYEOF'
+'@
+
+    # End-to-end pigpio check -- separate ssh call with base64-encoded
+    # Python source. The PowerShell -> ssh.exe -> bash argument path
+    # mangles multi-line content in two ways: (a) runs of whitespace in
+    # heredocs collapse, turning nested `if`/`else` bodies into an
+    # IndentationError; (b) embedded `"` in `python3 -c '...'` get
+    # stripped by PowerShell's native-arg quoting, silently deleting
+    # Python string delimiters. Base64 is whitespace- and quote-free so
+    # it arrives on the pager exactly as sent.
+    $pigpioCheckPy = @'
 try:
     import pigpio
 except Exception as e:
@@ -574,8 +645,9 @@ else:
         p.stop()
     else:
         print('  pigpio end-to-end: socket UNREACHABLE - daemon not listening?')
-PYEOF
 '@
+    $pigpioCheckB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pigpioCheckPy))
+    ssh @sshCmd $t "echo $pigpioCheckB64 | base64 -d | python3 2>&1"
 
     Write-Host "  [3/8] Waveshare E-Ink driver" -ForegroundColor Cyan
     ssh @sshCmd $t "mkdir -p ~/waveshare_epd; B=https://raw.githubusercontent.com/waveshare/e-Paper/master/RaspberryPi_JetsonNano/python/lib/waveshare_epd; for F in __init__.py epdconfig.py epd2in13_V4.py; do test -f ~/waveshare_epd/`$F || wget -q -O ~/waveshare_epd/`$F `$B/`$F; done; test -f ~/waveshare_epd/epd2in13_V4.py && echo OK || echo FAIL"
@@ -677,7 +749,7 @@ test -f /lib/systemd/system/pigpiod.service   && echo '[OK] pigpiod unit'       
 ls /dev/spidev0.0 >/dev/null 2>&1             && echo '[OK] SPI CE0 (E-Ink)'         || echo '[!!] SPI CE0 missing'
 ls /dev/spidev0.1 >/dev/null 2>&1             && echo '[OK] SPI CE1 (LoRa)'          || echo '[!!] SPI CE1 missing'
 test -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf && echo '[OK] DejaVu fonts'  || echo '[!!] DejaVu fonts missing'
-(ls /usr/share/fonts/X11/misc/ter-u14n.* 2>/dev/null | grep -q ter || ls /usr/share/fonts/X11/misc/*terminus* 2>/dev/null | grep -q terminus) && echo '[OK] Terminus font' || echo '[  ] Terminus font NOT installed (DejaVu fallback will be used)'
+(ls /usr/share/fonts/opentype/terminus/terminus-*.otb 2>/dev/null | grep -q otb || ls /usr/share/fonts/X11/misc/ter-u14n.* 2>/dev/null | grep -q ter || ls /usr/share/fonts/X11/misc/*terminus* 2>/dev/null | grep -q terminus) && echo '[OK] Terminus font' || echo '[  ] Terminus font NOT installed (DejaVu fallback will be used)'
 systemctl is-enabled kidpager       2>/dev/null | grep -q enabled && echo '[OK] kidpager autostart'          || echo '[!!] kidpager autostart'
 systemctl is-enabled kidpager-power 2>/dev/null | grep -q enabled && echo '[OK] Power-save (active on boot)' || echo '[!!] Power-save NOT enabled'
 systemctl is-active  pigpiod        2>/dev/null | grep -q active  && echo '[OK] pigpiod running'             || echo '[!!] pigpiod NOT running'
@@ -715,7 +787,7 @@ Write-Host "$okCount/$totalCount successful" -ForegroundColor $(if ($okCount -eq
 if ($okCount -gt 0) {
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor Yellow
-    Write-Host "  1. Pair the M4 on each pager:  ssh pi@kidpager.local -> sudo ~/bt_pair.sh" -ForegroundColor Yellow
+    Write-Host "  1. Pair the M4 on each pager:  ssh pi@kp3.local -> sudo ~/bt_pair.sh" -ForegroundColor Yellow
     Write-Host "  2. Reboot each pager once (power-save activates on boot)" -ForegroundColor Yellow
     Write-Host "  3. Verify:  .\deploy.ps1 -Diag" -ForegroundColor Yellow
     Write-Host "  (After reboot Wi-Fi is blocked. Alt+W on the M4 re-enables it for re-deploys.)" -ForegroundColor DarkGray

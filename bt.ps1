@@ -1,5 +1,5 @@
-# BT Pair — Usage: .\bt.ps1 -PiHost kidpager.local
-param([string]$PiHost = "kidpager.local", [string]$PiUser = "pi")
+# BT Pair — Usage: .\bt.ps1 -PiHost kp3.local
+param([string]$PiHost = "kp3.local", [string]$PiUser = "pi")
 $KEY = "$env:USERPROFILE\.ssh\id_kidpager"
 $ssh = @("-F", "nul", "-i", $KEY, "-o", "StrictHostKeyChecking=no", "-t")
 $scp = @("-F", "nul", "-i", $KEY, "-o", "StrictHostKeyChecking=no")

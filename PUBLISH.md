@@ -1,7 +1,7 @@
 # Publishing to GitHub
 
 Quick guide for tagging and pushing a new KidPager release. Current
-release: **v0.13**.
+release: **v0.14**.
 
 ## First-time setup (only once per machine)
 
@@ -34,24 +34,24 @@ git push -u origin main
 First push asks for credentials. Use a Personal Access Token, not your
 password — generate one at https://github.com/settings/tokens (scope: `repo`).
 
-## Release v0.13 (current)
+## Release v0.14 (current)
 
 ```powershell
 # Make sure everything is committed
 git add .
-git commit -m "Release v0.13 — sleep-screen ghosting fix + wifi-gated auto-sleep"
+git commit -m "Release v0.14 — terminus font + keyboard rewrite + cursor"
 git push
 
 # Tag and push the tag
-git tag -a v0.13 -m "KidPager v0.13 — clean sleep screen, Wi-Fi-aware auto-sleep"
-git push origin v0.13
+git tag -a v0.14 -m "KidPager v0.14 — no more dropped keys, sharper rendering, static cursor"
+git push origin v0.14
 ```
 
 Then on GitHub:
 
 1. Go to your repo → **Releases** (right sidebar) → **Draft a new release**
-2. **Choose a tag:** select `v0.13`
-3. **Release title:** `KidPager v0.13`
+2. **Choose a tag:** select `v0.14`
+3. **Release title:** `KidPager v0.14`
 4. **Description:** copy the contents of `RELEASE_NOTES.md` into the description box
 5. Click **Publish release**
 
@@ -72,7 +72,7 @@ Before tagging, make sure these are consistent:
 
 ## Future updates
 
-For subsequent versions, bump the patch (v0.14) for bug fixes, minor (v0.20)
+For subsequent versions, bump the patch (v0.15) for bug fixes, minor (v0.20)
 for feature additions, major (v1.0) once the project is considered stable:
 
 ```powershell
@@ -80,8 +80,8 @@ git add .
 git commit -m "Describe what changed"
 git push
 
-git tag -a v0.14 -m "KidPager v0.14 — what's new in one sentence"
-git push origin v0.14
+git tag -a v0.15 -m "KidPager v0.15 — what's new in one sentence"
+git push origin v0.15
 ```
 
 Then draft a new release on GitHub for that tag with the RELEASE_NOTES.md

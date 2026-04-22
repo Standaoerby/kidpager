@@ -17,14 +17,6 @@ every glyph is hand-pixelled for 1bpp output, no anti-aliasing rounding.
 Terminus is monospace. Header and small labels keep DejaVu (proportional
 spacing looks better for the sender name and status badges).
 
-Emoji support: Terminus doesn't have emoji glyphs, neither does DejaVu
-Sans. We fall back to DejaVu Sans for any char outside the Terminus
-BMP range; missing glyphs render as Pillow's default "tofu" box which
-is visible but not useful. For v0.14 the user sees a placeholder for
-emoji on the E-Ink; the text still goes through and renders correctly
-on any device with a broader font. A future release can switch to a
-Unicode-wide bitmap font like GNU Unifont for real emoji on-device.
-
 Cursor
 ------
 A static underscore ``_`` is drawn immediately after the last character
@@ -62,9 +54,10 @@ _STATUS_SENDING = "~"
 # --- Font loading -----------------------------------------------------------
 #
 # Strategy:
-#   1. Try Terminus in its canonical Debian path. Terminus ships as a
-#      PCF file for X/console plus a TTF conversion (fonts-terminus-otb
-#      on Bookworm) which Pillow can load.
+#   1. Try Terminus in its canonical Debian paths. The fonts-terminus-otb
+#      package (present on Bookworm and Trixie) ships .otb (OpenType
+#      Bitmap) files which Pillow loads via its truetype() API. Path
+#      changed between releases -- see _TERMINUS_CANDIDATES below.
 #   2. Fall back to DejaVu Sans if Terminus isn't installed. DejaVu is
 #      already a hard dependency (fonts-dejavu-core in deploy.ps1).
 #   3. Final fallback: Pillow's built-in default font (tiny bitmap).
@@ -104,10 +97,18 @@ def _load_font(paths, size):
 
 
 # Terminus body font for message text + input line. Try multiple names
-# because packaging differs across distros: fonts-terminus-otb (Debian
-# Bookworm / Trixie), xfonts-terminus (older), Terminus on Arch, etc.
+# because packaging layout changed between Debian releases:
+#   * Trixie (testing/stable 13, our current target) — fonts-terminus-otb
+#     4.48-3.1 installs to /usr/share/fonts/opentype/terminus/ with the
+#     maintainer-chosen `terminus-normal.otb` naming.
+#   * Bookworm (12) shipped the same .otb files under /usr/share/fonts/X11/misc/
+#     with upstream names (`ter-u14n.otb` etc.).
+#   * xfonts-terminus, Arch, etc. ship TTF conversions at varied paths.
+# Order matters: we return the first hit, so the Trixie path is first because
+# that's what lives on the pagers we actually deploy to.
 _TERMINUS_CANDIDATES = [
-    "/usr/share/fonts/X11/misc/ter-u14n.otb",   # Debian fonts-terminus-otb
+    "/usr/share/fonts/opentype/terminus/terminus-normal.otb",  # Debian Trixie
+    "/usr/share/fonts/X11/misc/ter-u14n.otb",                  # Debian Bookworm
     "/usr/share/fonts/X11/misc/ter-u16n.otb",
     "/usr/share/fonts/terminus/TerminusTTF.ttf",
     "/usr/share/fonts/truetype/terminus/TerminusTTF.ttf",

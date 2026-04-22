@@ -8,7 +8,7 @@ Everything you need to build **two** pagers (each pager is pointless by itself
 | # | Part | Spec / part number | Qty | ~Price | Notes |
 |---|---|---|---|---|---|
 | 1 | Raspberry Pi Zero 2 W | with 40-pin header pre-soldered | 1 | $15 | not Zero W — Zero 2 W has the quad-core SoC |
-| 2 | microSD card | 8 GB+, Class 10 / A1 | 1 | $5 | flashed with Raspberry Pi OS **Bookworm Lite** |
+| 2 | microSD card | 8 GB+, Class 10 / A1 | 1 | $5 | flashed with Raspberry Pi OS **Trixie Lite** (Bookworm Lite also works) |
 | 3 | E-Ink HAT | **Waveshare 2.13" V4** (250×122, mono) | 1 | $20 | Waveshare SKU 19717; V4 specifically (V2/V3 have different driver init) |
 | 4 | LoRa module | **Waveshare Core1262-HF** (SX1262, 868 MHz) | 1 | $12 | the -HF (+22 dBm HP PA). Core1262-LF is 433 MHz — wrong band |
 | 5 | Antenna | 868 MHz, SMA-M or IPEX, λ/4 helical or stubby | 1 | $3 | must match LoRa module's connector |
@@ -41,7 +41,7 @@ USB-C (on TP4056 module) ──→ TP4056 (1 A charge)
                                      │
                                      └──→ CKCS boost IN ──→ 5 V ──→ Pi Zero
                                                                      ├── E-Ink HAT
-                                                                     └── SX1276 LoRa
+                                                                     └── SX1262 LoRa
 ```
 
 **Why the external charger.** The M4 keyboard has its own onboard charger
@@ -157,35 +157,61 @@ into it. All charging goes through the TP4056 module's USB-C.
 
 ## Assembly order
 
-1. **Flash SD card** with Raspberry Pi OS Bookworm Lite. First-boot: enable
-   SSH and Wi-Fi via `rpi-imager`'s customization screen. Set hostname to
-   `kidpager` (and `kidpager2` on the second device).
-2. **Verify the Pi boots** over SSH before touching the soldering iron. A
-   dead Pi with wires already soldered is no fun to debug.
-3. **Solder LoRa wires to the Pi header** (top side, so the HAT can still
+1. **Flash SD card** with Raspberry Pi OS Trixie Lite (or Bookworm Lite). In
+   `rpi-imager`'s customization screen set:
+   - Hostname: `kp2` (and `kp3` on the second device)
+   - SSH: enabled (password auth is fine; deploy.ps1 replaces it with a key)
+   - Username: `pi`, any password
+   - Wi-Fi: SSID + password (Pi Zero 2 W has no ethernet)
+   - Locale: your timezone + keyboard layout
+2. **Verify the Pi boots** over SSH before touching the soldering iron:
+   ```
+   ssh pi@kp3.local
+   ```
+   A dead Pi with wires already soldered is no fun to debug.
+3. **Enable passwordless sudo on the Pi.** `deploy.ps1` issues ~20 sudo
+   commands per run; each missing NOPASSWD is a hang. From the SSH session:
+   ```bash
+   echo "pi ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/010_pi-nopasswd
+   sudo chmod 0440 /etc/sudoers.d/010_pi-nopasswd
+   sudo visudo -c    # verify syntax
+   ```
+   Log out. (`deploy.ps1` detects a missing NOPASSWD and prints this exact
+   fix, so it's recoverable if skipped.)
+4. **Run initial deploy from Windows** — pushes code, installs packages,
+   builds pigpio from source, enables kidpager.service:
+   ```powershell
+   cd path\to\kidpager
+   .\deploy.ps1 -Setup       # installs SSH key (one password prompt)
+   .\deploy.ps1 -All         # full deploy (takes ~3-5 min first time)
+   ```
+   The pigpio build from source is the slow step — be patient, don't
+   interrupt. Subsequent re-runs of `-All` are 30-60 s (idempotent).
+5. **Solder LoRa wires to the Pi header** (top side, so the HAT can still
    seat on the pins). Use 28-30 AWG silicone wire. Keep each wire <5 cm.
    Heat-shrink every solder joint to avoid shorts when the HAT lands on top.
-4. **Solder buzzer + resistor.** Resistor goes in series with the buzzer `+`
+6. **Solder buzzer + resistor.** Resistor goes in series with the buzzer `+`
    lead. One leg to pin 33, resistor body, buzzer `+`. Buzzer `−` to pin 34.
-5. **Plug the Waveshare 2.13" HAT** onto the 40-pin header. It covers the
+7. **Plug the Waveshare 2.13" HAT** onto the 40-pin header. It covers the
    top — your soldered wires stick out the back side.
-6. **Connect the LoRa module.** Tape or hot-glue it to the underside of the
+8. **Connect the LoRa module.** Tape or hot-glue it to the underside of the
    Pi (the side without the HAT), antenna wire routed to a case exit.
-7. **Disconnect the M4's stock battery** (the original 300 mAh cell on the
+9. **Disconnect the M4's stock battery** (the original 300 mAh cell on the
    keyboard PCB — snip its leads near the pouch, not at the pad).
-8. **Wire the battery through TP4056** as per the power table above.
-   **Double-check polarity with a multimeter** before any wire touches
-   the TP4056 — reversing the battery kills the DW01A on the spot and
-   may set fire to the cell.
-9. **Wire boost output to the Pi's 5V rail.** Again: meter-check polarity
-   and output voltage (~5.0-5.1 V) before plugging into the Pi.
-10. **Pair the M4 keyboard** over Bluetooth — see [README.md](README.md#bluetooth-keyboard-pairing).
-11. **Run diagnostics:**
+10. **Wire the battery through TP4056** as per the power table above.
+    **Double-check polarity with a multimeter** before any wire touches
+    the TP4056 — reversing the battery kills the DW01A on the spot and
+    may set fire to the cell.
+11. **Wire boost output to the Pi's 5V rail.** Again: meter-check polarity
+    and output voltage (~5.0-5.1 V) before plugging into the Pi.
+12. **Pair the M4 keyboard** over Bluetooth — see [README.md](README.md#bluetooth-keyboard-pairing).
+13. **Run diagnostics:**
     ```bash
     cd ~/kidpager && sudo python3 diagnose.py -y
     ```
-    All checks should pass. The most common failure is `LoRa BUSY LOW after
-    reset` — 9/10 times it's a cold solder joint on GPIO 23 / phys pin 16.
+    Or remotely from Windows: `.\deploy.ps1 -Diag`. All checks should pass.
+    The most common failure is `LoRa BUSY LOW after reset` — 9/10 times it's
+    a cold solder joint on GPIO 23 / phys pin 16.
 
 ## Power budget (rough)
 
@@ -221,9 +247,9 @@ empty in ~3 hours even with the pager running.
 - **BlueZ "Bonded: no"** is the single most common keyboard failure. Always
   pair via `bt_pair.sh` (single piped `bluetoothctl` session), never via
   separate `bluetoothctl pair` → `trust` → `connect` invocations.
-- **pigpio on Bookworm** — the apt package was dropped. `deploy.ps1` builds
-  it from source. Don't try `sudo apt install pigpio` — it won't work on
-  Raspberry Pi OS Bookworm.
+- **pigpio on Bookworm/Trixie** — the apt package was dropped. `deploy.ps1`
+  builds it from source. Don't try `sudo apt install pigpio` — it won't
+  work on Raspberry Pi OS Bookworm or Trixie.
 - **TP4056 variant matters.** The bare TP4056 breakout (1 chip only) does
   not disconnect the load at undervoltage — if you use that variant, a
   stray discharge can kill the cell even though the software is fine.

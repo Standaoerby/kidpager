@@ -1,6 +1,6 @@
 # KidPager v0.14
 
-Four-in-one UX release targeting feedback from hands-on use.
+Three-in-one UX release targeting feedback from hands-on use.
 
 Software-only, but you need one extra apt package to get the new font.
 Add `fonts-terminus-otb` to the `apt install` line in `deploy.ps1`
@@ -75,39 +75,15 @@ Mid-line editing (LEFT/RIGHT inside the buffer) is still not
 supported — those keys remain menu/scroll navigation. Backspace is
 the edit-mid-line tool for now.
 
-### 4. Emoji shortcuts
-
-Type `:)` and it turns into 🙂. Fifteen common text-face mappings:
-
-| Type | Get | Type | Get | Type | Get |
-|---|---|---|---|---|---|
-| `:)` | 🙂 | `:(` | 🙁 | `:D` | 😄 |
-| `:P` | 😛 | `:O` | 😮 | `;)` | 😉 |
-| `<3` | ❤️ | `:\|` | 😐 | `:*` | 😘 |
-| `xD` | 😆 | `XD` | 😆 | `:'(` | 😢 |
-| `^_^` | 😊 | `o_O` | 🤨 | `O_o` | 🤨 |
-
-Replacement happens at the **trailing edge** as you type, so the
-E-Ink view shows the final character as soon as you type the last
-character of the sequence. The send-time path also does a
-full-buffer sweep, so shortcuts you typed past without pausing still
-get expanded before going on the air.
-
-Emoji travel as plain UTF-8 inside the existing LoRa payload — no
-protocol change, two pagers on v0.14 just work, v0.14 ↔ v0.13 still
-works but the v0.13 pager won't have glyphs for the emoji so it
-will render Pillow's default "tofu" boxes.
-
-Backspace on an emoji with a Unicode variation selector (the heart
-❤️ is U+2764 + VS16) deletes the full visible glyph in one press,
-not the VS16 alone.
-
 ## Deploy
 
 The only out-of-band step is the font package. Open `deploy.ps1`,
 find step `[1/8]` (the `apt install` line), and add
 `fonts-terminus-otb` to the package list. The package name is correct
-for Bookworm; on older Raspberry Pi OS try `xfonts-terminus` instead.
+for both Bookworm and Trixie; on older Raspberry Pi OS try
+`xfonts-terminus` instead. The font driver checks both the Trixie path
+(`/usr/share/fonts/opentype/terminus/terminus-normal.otb`) and the
+Bookworm path (`/usr/share/fonts/X11/misc/ter-u14n.otb`) at runtime.
 If the package isn't found, deploy still succeeds and the code falls
 back to DejaVu — no crash, just v0.13 rendering.
 
@@ -120,7 +96,7 @@ Then:
 Verify on each pager with
 
 ```bash
-ssh kidpager.local journalctl -u kidpager -n 20 --no-pager
+ssh kp3.local journalctl -u kidpager -n 20 --no-pager
 ```
 
 The first line after boot should read roughly
@@ -132,16 +108,10 @@ The first line after boot should read roughly
 - Terminus is mono-width, so the chat area fits fewer characters per
   line than DejaVu Sans did. The word-wrap routine handles this
   automatically; no layout bugs but messages wrap earlier.
-- 15 emoji shortcuts only. Adding more is a two-line change in
-  `ui.EMOJI_SHORTCUTS`.
-- No emoji font on the device — emoji render as Pillow's default
-  "tofu" glyph on E-Ink. Future work: switch to GNU Unifont or a
-  custom 12×12 sprite set to render smiles natively.
 - Mid-line caret movement (LEFT/RIGHT inside the input buffer) is
   still not implemented.
 
 ## Version interop
 
 - v0.14 ↔ v0.14: fully interoperable.
-- v0.14 ↔ v0.13: messages work both ways; emoji sent from v0.14 show
-  as tofu on v0.13.
+- v0.14 ↔ v0.13: messages work both ways.

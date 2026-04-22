@@ -19,14 +19,6 @@ States:
   "sleep"        -- screen saver after IDLE_TIMEOUT seconds of inactivity.
                     Any key or incoming message returns to "chat".
 
-Emoji shortcuts
----------------
-Typing ``:)`` replaces the trailing 2 chars in the input buffer with
-the slightly-smiling Unicode emoji. Table below. Replacement is done
-at append time (so the E-Ink view already shows the emoji as the user
-types) and again at send time (``expand_emoji_in_full``) to catch any
-shortcuts the user typed past without pausing.
-
 Cursor
 ------
 A static underscore ``_`` is drawn at the END of the input buffer. We
@@ -55,68 +47,6 @@ CHECK_INTERVAL = 2
 HISTORY_FILE = os.path.expanduser("~/.kidpager/history.json")
 MAX_HISTORY = 100
 EINK_WINDOW = 30
-
-# Emoji shortcut table. Each entry = (typed_sequence, emoji_char).
-# The emoji is sent on the air as UTF-8 like any other character, so
-# nothing in lora.py changes. Entries are sorted longest-first at
-# module load so ":'(" matches before ":(" and "XD" before "X".
-EMOJI_SHORTCUTS = [
-    (":)",  "\U0001F642"),  # 🙂
-    (":(",  "\U0001F641"),  # 🙁
-    (":D",  "\U0001F604"),  # 😄
-    (":P",  "\U0001F61B"),  # 😛
-    (":O",  "\U0001F62E"),  # 😮
-    (";)",  "\U0001F609"),  # 😉
-    ("<3",  "\u2764\uFE0F"), # ❤️
-    (":|",  "\U0001F610"),  # 😐
-    (":*",  "\U0001F618"),  # 😘
-    ("xD",  "\U0001F606"),  # 😆
-    ("XD",  "\U0001F606"),  # 😆
-    (":'(", "\U0001F622"),  # 😢
-    ("^_^", "\U0001F60A"),  # 😊
-    ("o_O", "\U0001F928"),  # 🤨
-    ("O_o", "\U0001F928"),  # 🤨
-]
-_EMOJI_SORTED = sorted(EMOJI_SHORTCUTS, key=lambda kv: -len(kv[0]))
-
-# Fast lookup: index the shortcut table by the LAST character of each
-# sequence. Most keystrokes (letters, digits, space) won't end on a
-# trigger char, so we can reject them with a single dict lookup instead
-# of iterating all 15 sequences and running endswith on each. The
-# values are still longest-first within their bucket so ":'(" still
-# matches before ":(" and "o_O" before nothing-with-just-O.
-_EMOJI_BY_LAST = {}
-for _seq, _emoji in _EMOJI_SORTED:
-    _EMOJI_BY_LAST.setdefault(_seq[-1], []).append((_seq, _emoji))
-
-
-def apply_emoji_shortcuts(text):
-    """If ``text`` ends with one of the shortcut sequences, replace the
-    trailing sequence with the corresponding emoji. Returns
-    ``(new_text, replaced)``. Only the trailing position is considered
-    so mid-sentence colons don't get ambushed. Fast path: if the final
-    character is not in any shortcut sequence, returns immediately
-    without iterating the table."""
-    if not text:
-        return text, False
-    candidates = _EMOJI_BY_LAST.get(text[-1])
-    if not candidates:
-        return text, False
-    for seq, emoji in candidates:
-        if text.endswith(seq):
-            return text[:-len(seq)] + emoji, True
-    return text, False
-
-
-def expand_emoji_in_full(text):
-    """Expand every occurrence of every shortcut anywhere in ``text``.
-    Run at send time so messages like "hi :) ok :(" come out correctly
-    even if the user didn't pause between shortcuts (the trailing-only
-    replacement would have missed the middle one)."""
-    for seq, emoji in _EMOJI_SORTED:
-        if seq in text:
-            text = text.replace(seq, emoji)
-    return text
 
 
 def relative_time(ts):
@@ -246,12 +176,6 @@ class PagerUI:
             return "send"
         elif key == "BACKSPACE":
             if self.input_buf:
-                # Strip trailing Unicode variation selectors (U+FE00-FE0F)
-                # first so one backspace deletes the visible glyph (e.g.
-                # the emoji-style heart is ❤ + VS16).
-                while (self.input_buf
-                       and 0xFE00 <= ord(self.input_buf[-1]) <= 0xFE0F):
-                    self.input_buf = self.input_buf[:-1]
                 self.input_buf = self.input_buf[:-1]
                 return "typing"
         elif key == "ESC" or key == "TAB":
@@ -273,10 +197,6 @@ class PagerUI:
         elif isinstance(key, str) and len(key) == 1:
             self.input_buf += key
             self.scroll = 0
-            # Trailing-only shortcut replacement after each printable
-            # key. Mid-buffer shortcuts that the user types past
-            # without pausing are expanded later in get_message().
-            self.input_buf, _ = apply_emoji_shortcuts(self.input_buf)
             # Signal "typing in progress" explicitly so main.py's
             # debounce logic only arms for real chat-typing and
             # doesn't pile a second E-Ink refresh on top of the
@@ -349,10 +269,9 @@ class PagerUI:
 
     # ---------- messages ----------
     def get_message(self):
-        """Return the send-ready string (shortcuts expanded, whitespace
-        stripped) and clear the input buffer."""
+        """Return the send-ready string (whitespace stripped) and clear
+        the input buffer."""
         msg = self.input_buf.strip()
-        msg = expand_emoji_in_full(msg)
         self.input_buf = ""
         return msg
 
