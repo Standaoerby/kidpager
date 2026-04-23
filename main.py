@@ -35,7 +35,7 @@ enters sleep. Any key wakes; incoming message also wakes and plays
 Auto-sleep is suppressed while Wi-Fi is on -- Wi-Fi on = live SSH
 session = don't ambush the user with a full-refresh flash mid-debug.
 """
-import asyncio, os, sys, time
+import asyncio, os, sys, time, subprocess
 from config import Config
 from keyboard import KeyboardReader
 from lora import LoRaRadio
@@ -92,6 +92,13 @@ async def main():
     # its deque we print a warning so journalctl shows the problem.
     last_dropped = 0
 
+    # Set to True when the user confirms reboot in the profile menu.
+    # We break out of the main loop, let the `finally` cleanup run so
+    # the display sleep is clean and history.json is flushed, then
+    # return this flag so the __main__ block can fire `systemctl reboot`
+    # only after Python has released the hardware.
+    reboot_requested = False
+
     try:
         while True:
             got_typing = False  # a printable character was added in chat state
@@ -111,6 +118,7 @@ async def main():
                 elif a == "toggle_wifi":    action = "toggle_wifi"
                 elif a == "silent_changed": action = "silent_changed"
                 elif a == "wake":           action = "wake"
+                elif a == "reboot":         action = "reboot"
                 elif a == "typing":         got_typing = True
                 # Anything else (None) = non-typing action whose
                 # handler already did its own redraw (menu nav,
@@ -159,6 +167,13 @@ async def main():
             elif action == "wake":
                 eink_pending = False
                 last_eink_draw = time.time()
+            elif action == "reboot":
+                # UI has already drawn "Rebooting..." to the E-Ink and
+                # persisted history. Bail out of the main loop; `finally`
+                # does the hardware teardown and the caller fires the
+                # actual `systemctl reboot` once we're out.
+                reboot_requested = True
+                break
             elif got_typing:
                 # At least one printable char landed this tick.
                 # Schedule a debounced redraw; also nudge the TTY line
@@ -249,6 +264,10 @@ async def main():
             except Exception as e: print(f"lora.cleanup error: {e}")
         if ui.eink:
             try:
+                # cleanup() joins the worker after letting its queue
+                # drain, so the "Rebooting..." frame we queued in
+                # _handle_reboot_confirm is guaranteed to hit the
+                # panel before sleep() freezes the image.
                 ui.eink.cleanup()
                 ui.eink.sleep()
             except Exception as e: print(f"eink cleanup error: {e}")
@@ -257,6 +276,38 @@ async def main():
         try: kb.close()
         except Exception as e: print(f"kb.close error: {e}")
 
+    return reboot_requested
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    should_reboot = asyncio.run(main())
+    if should_reboot:
+        # Open the deploy window for the next boot. kidpager-power.sh
+        # consumes this file to decide whether to keep Wi-Fi up (so the
+        # operator can SSH in and redeploy) or apply the normal power-save
+        # block. The value is the number of seconds Wi-Fi stays up before
+        # a transient systemd-run timer re-blocks it. 600 s = 10 min, which
+        # covers a two-pager sequential redeploy with comfortable headroom.
+        #
+        # Writing this flag on EVERY UI-triggered reboot is intentional:
+        # the pager lives in the field in power-save mode, so the only
+        # reason to expose a reboot button there is to service the device.
+        DEPLOY_WINDOW_SEC = 600
+        try:
+            os.makedirs("/var/lib/kidpager", exist_ok=True)
+            with open("/var/lib/kidpager/deploy-window", "w") as f:
+                f.write(str(DEPLOY_WINDOW_SEC))
+        except Exception as e:
+            print(f"deploy-window flag write failed: {e}")
+
+        # Fire the reboot only AFTER asyncio has unwound and the
+        # cleanup above has released SPI / GPIO / pigpiod. Running
+        # `systemctl reboot` from inside the try/finally would race
+        # with systemd sending SIGTERM to us — this way the service
+        # exits 0 first and systemd handles the reboot cleanly.
+        # Popen (not run): we're about to be killed anyway and don't
+        # want to block on the reboot command's own teardown.
+        try:
+            subprocess.Popen(["systemctl", "reboot"])
+        except Exception as e:
+            print(f"reboot spawn failed: {e}")

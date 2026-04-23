@@ -12,12 +12,21 @@ While a message is being retransmitted, its status stays STATUS_SENDING (`~`)
 but the UI shows `~1`, `~2`, ... so the user can see the attempt count.
 
 States:
-  "chat"         -- main view: messages + input line
-  "profile"      -- TAB/ESC menu: Name / Channel / Silent / Back
-  "name_edit"    -- text edit for name
-  "channel_edit" -- number picker for channel
-  "sleep"        -- screen saver after IDLE_TIMEOUT seconds of inactivity.
-                    Any key or incoming message returns to "chat".
+  "chat"            -- main view: messages + input line
+  "profile"         -- TAB/ESC menu: Name / Channel / Silent / Reboot
+  "name_edit"       -- text edit for name
+  "channel_edit"    -- number picker for channel
+  "reboot_confirm"  -- numeric confirmation before issuing a reboot.
+                       Key `1` returns action="reboot" (main loop flushes,
+                       tears down hardware, then main.py fires
+                       systemctl reboot). Key `2` / ESC / TAB / BACKSPACE
+                       cancel back to the profile menu. Numeric choice
+                       rather than ENTER/ESC so a kid can't trigger a
+                       reboot with a stray ENTER while scrolling.
+  "rebooting"       -- last frame shown while systemd tears the service
+                       down; no key handler (the process is about to die).
+  "sleep"           -- screen saver after IDLE_TIMEOUT seconds of inactivity.
+                       Any key or incoming message returns to "chat".
 
 Cursor
 ------
@@ -87,7 +96,11 @@ class PagerUI:
     PROF_NAME = 0
     PROF_CHANNEL = 1
     PROF_SILENT = 2
-    PROF_BACK = 3
+    # v1.0: slot 3 was "Back to chat" in v0.14, but TAB/ESC already exits
+    # the profile, so the row was redundant. Repurposed as "Reboot device"
+    # (with a confirmation screen) so a field operator without SSH access
+    # can cleanly cycle the pager after changing channel or pairing.
+    PROF_REBOOT = 3
     PROF_COUNT = 4
 
     def __init__(self, config, lora=None):
@@ -162,10 +175,17 @@ class PagerUI:
             return "toggle_wifi"
         if self.state == "sleep":
             return self._handle_sleep(key)
-        if self.state == "chat":           return self._handle_chat(key)
-        elif self.state == "profile":      return self._handle_profile(key)
-        elif self.state == "name_edit":    return self._handle_name_edit(key)
-        elif self.state == "channel_edit": return self._handle_channel_edit(key)
+        if self.state == "rebooting":
+            # Terminal state: we've already drawn "Rebooting..." and the
+            # main loop is about to tear everything down. Ignore any
+            # late keystrokes that slipped through the queue so we
+            # don't flash the display or kick debounce machinery.
+            return None
+        if self.state == "chat":             return self._handle_chat(key)
+        elif self.state == "profile":        return self._handle_profile(key)
+        elif self.state == "name_edit":      return self._handle_name_edit(key)
+        elif self.state == "channel_edit":   return self._handle_channel_edit(key)
+        elif self.state == "reboot_confirm": return self._handle_reboot_confirm(key)
         return None
 
     def set_wifi(self, on):
@@ -219,10 +239,34 @@ class PagerUI:
                 self.config.save()
                 self.full_redraw()
                 return "silent_changed"
-            elif self.profile_sel == self.PROF_BACK:
-                self.config.save(); self.state = "chat"; self.full_redraw()
+            elif self.profile_sel == self.PROF_REBOOT:
+                # Persist any pending profile edits before the reboot
+                # confirmation path so a mid-confirm power-off doesn't
+                # lose them.
+                self.config.save()
+                self.state = "reboot_confirm"
+                self.full_redraw()
         elif key == "ESC" or key == "TAB":
             self.config.save(); self.state = "chat"; self.full_redraw()
+        return None
+
+    def _handle_reboot_confirm(self, key):
+        # Numeric confirmation (1 = reboot, 2 = cancel) instead of
+        # ENTER/ESC: the kid can't trigger a reboot with a stray ENTER
+        # press while scrolling, and the confirmation screen explicitly
+        # shows the two options as a labelled menu. ESC/TAB still cancel
+        # as an escape hatch so the profile menu feels consistent.
+        if key == "1":
+            # Switch to the terminal "rebooting" frame and flush history
+            # before main.py drops out of the loop. flush_history is a
+            # no-op if _dirty is false, so repeat calls are cheap.
+            self.state = "rebooting"
+            self.flush_history()
+            self.full_redraw()
+            return "reboot"
+        if key in ("2", "ESC", "TAB", "BACKSPACE"):
+            self.state = "profile"
+            self.full_redraw()
         return None
 
     def _handle_name_edit(self, key):
@@ -345,6 +389,10 @@ class PagerUI:
                 self.eink.draw_name_edit(self.config.name)
             elif self.state == "channel_edit":
                 self.eink.draw_channel_edit(self.config.channel)
+            elif self.state == "reboot_confirm":
+                self.eink.draw_reboot_confirm(self.config.name)
+            elif self.state == "rebooting":
+                self.eink.draw_rebooting(self.config.name)
             elif self.state == "sleep":
                 self.eink.draw_sleep(self.config.name, self.config.silent)
         except Exception as e:
@@ -360,8 +408,13 @@ class PagerUI:
         lora = "LoRa:ON" if self.lora else "LoRa:OFF"
         wifi = "  WiFi:ON" if self.wifi_on else ""
         mute = "  MUTE" if self.config.silent else ""
-        sleep_tag = "  [SLEEP]" if self.state == "sleep" else ""
-        print(f"\033[2J\033[H KidPager [{self.config.name}]  {lora}{wifi}{mute}{sleep_tag}")
+        state_tags = {
+            "sleep": "  [SLEEP]",
+            "reboot_confirm": "  [REBOOT?]",
+            "rebooting": "  [REBOOTING]",
+        }
+        state_tag = state_tags.get(self.state, "")
+        print(f"\033[2J\033[H KidPager [{self.config.name}]  {lora}{wifi}{mute}{state_tag}")
         print("-" * 50)
         end = len(self.messages) - self.scroll
         start = max(0, end - 8)

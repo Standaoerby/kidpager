@@ -135,6 +135,12 @@ FONT_SM = _load_font([_DEJAVU_SANS], 10) or _DEFAULT
 # Bold for header. DejaVu Bold looks better for the owner name.
 FONT_BD = _load_font([_DEJAVU_BOLD], 12) or _DEFAULT
 
+# Medium bold for multi-word headings on full-screen frames (e.g.
+# "Rebooting..."). 20 px keeps 12-char strings comfortably under the
+# 250 px panel width whereas FONT_BIG 36 px overflows anything longer
+# than ~7 chars.
+FONT_MD = _load_font([_DEJAVU_BOLD], 20) or _DEFAULT
+
 # Big bold for the sleep screen Zzz glyph.
 FONT_BIG = _load_font([_DEJAVU_BOLD], 36) or _DEFAULT
 
@@ -341,7 +347,7 @@ class EInkDisplay:
             f"Name: {name}",
             f"Channel: {channel}",
             silent_label,
-            "Back to chat",
+            "Reboot device",
         ]
         y = 22
         row_h = 22
@@ -384,6 +390,47 @@ class EInkDisplay:
         d.text((10, 96), "ENTER: save", font=FONT_SM, fill=0)
         self._submit(img)
 
+    def draw_reboot_confirm(self, name):
+        """Numeric-choice confirmation before issuing a reboot from the
+        profile menu. Forced full refresh so the previous menu frame
+        doesn't ghost under the prompt (the selected row in the menu is
+        a black-filled rectangle, which partial refresh can leave faint
+        artifacts of). Numeric keys instead of ENTER/ESC: the kid can't
+        trigger a reboot with a stray ENTER while scrolling the chat."""
+        img = Image.new("1", (WIDTH, HEIGHT), 255)
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, WIDTH, HEADER_H - 1], fill=0)
+        d.text((3, 1), "REBOOT DEVICE", font=FONT_BD, fill=255)
+        # Visually distinct warning box so the kid doesn't confirm by reflex.
+        d.rectangle([6, 24, WIDTH - 6, 60], outline=0)
+        prompt = "Reboot now?"
+        pw = _text_width(FONT_BD, prompt)
+        d.text(((WIDTH - pw) // 2, 34), prompt, font=FONT_BD, fill=0)
+        d.text((10, 70), "1  yes, reboot", font=FONT, fill=0)
+        d.text((10, 88), "2  cancel", font=FONT, fill=0)
+        nw = _text_width(FONT_SM, name)
+        d.text((WIDTH - nw - 4, HEIGHT - 12), name, font=FONT_SM, fill=0)
+        self._submit(img, force_full=True)
+
+    def draw_rebooting(self, name):
+        """Terminal frame shown after the user confirms. Display stays
+        on this image until the kernel actually cuts power, so it needs
+        to look intentional (not like a crash). FONT_MD (not FONT_BIG)
+        because 'Rebooting...' at 36 px overflows the 250 px panel.
+        Force-full refresh to make sure it's legible on first draw."""
+        img = Image.new("1", (WIDTH, HEIGHT), 255)
+        d = ImageDraw.Draw(img)
+        msg = "Rebooting..."
+        mw = _text_width(FONT_MD, msg)
+        # max(0, ...) guards against a tiny pathological font that
+        # somehow renders wider than the panel; the text gets left-
+        # clipped instead of disappearing off-screen on the left.
+        x = max(0, (WIDTH - mw) // 2)
+        d.text((x, 40), msg, font=FONT_MD, fill=0)
+        nw = _text_width(FONT_BD, name)
+        d.text((max(0, (WIDTH - nw) // 2), 80), name, font=FONT_BD, fill=0)
+        self._submit(img, force_full=True)
+
     def draw_sleep(self, name, silent=False):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
@@ -411,7 +458,15 @@ class EInkDisplay:
         while not self._stop:
             self._wake.wait()
             self._wake.clear()
-            while not self._stop:
+            # Drain pending UNCONDITIONALLY — not `while not self._stop`. If
+            # cleanup() sets _stop between the outer `wait()` and the
+            # inner check, the last submitted frame (typically the
+            # "Rebooting..." screen queued right before teardown) would
+            # otherwise be discarded without a render, leaving the
+            # prior menu frame on the panel until the kernel cuts power.
+            # Drain first, check stop second: guarantees the final frame
+            # always reaches the E-Ink even during a clean shutdown.
+            while True:
                 with self._lock:
                     img = self._pending
                     force_full = self._pending_force_full

@@ -2,15 +2,19 @@
 #
 # Usage:
 #   .\deploy.ps1 -Help                              # show this usage block
-#   .\deploy.ps1 -Setup                             # install SSH key on both pagers (no code push)
-#   .\deploy.ps1 -All                               # deploy to both pagers (auto-installs key if missing)
-#   .\deploy.ps1 -PiHost kp3.local             # deploy to one pager
-#   .\deploy.ps1 -Restart                           # restart kidpager.service on both
-#   .\deploy.ps1 -WipeHistory                       # clear chat history on both
-#   .\deploy.ps1 -All -WipeHistory                  # deploy then wipe
-#   .\deploy.ps1 -All -Tests                        # deploy + also copy test_*.py
-#   .\deploy.ps1 -Diag                              # run full diagnose.py on both
-#   .\deploy.ps1 -Diag -PiHost kp3.local       # diagnose one pager
+#   .\deploy.ps1                                    # deploy + full test on both default pagers
+#   .\deploy.ps1 kp2.local                          # deploy + full test on one pager
+#   .\deploy.ps1 kp1.local,kp2.local                # deploy + full test on multiple (comma-separated)
+#   .\deploy.ps1 -NoTest                            # deploy without the post-deploy diagnose.py run
+#   .\deploy.ps1 -Setup                             # install SSH key on targets (no code push)
+#   .\deploy.ps1 -Restart                           # restart kidpager.service on targets
+#   .\deploy.ps1 -WipeHistory                       # clear chat history on targets
+#   .\deploy.ps1 -Tests                             # deploy + also copy test_*.py
+#   .\deploy.ps1 -Diag                              # run full diagnose.py on targets (no code push)
+#
+# SSH key install, hostname resolution and passwordless-sudo check all run
+# automatically for every target. First contact asks for the pi password
+# ONCE per device to install the key; after that, zero prompts.
 #
 # Target OS: Raspberry Pi OS Trixie Lite (Python 3.13) on Pi Zero 2 W.
 #
@@ -28,7 +32,7 @@
 # Pre-requisites (set in rpi-imager BEFORE flashing -- saves half a day of
 # post-boot fiddling):
 #
-#   * Hostname            kp2   (or kp3 for the second device)
+#   * Hostname            kp1   (or kp2 for the second device)
 #   * SSH                 enabled
 #   * Wi-Fi               SSID + password (no ethernet on Pi Zero 2 W)
 #   * Username            pi
@@ -38,14 +42,22 @@
 #
 # Forgot passwordless sudo? The script detects it and shows the fix. You
 # can also pre-apply manually:
-#   ssh -t pi@kp3.local
+#   ssh -t pi@kp2.local
 #   echo 'pi ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/010_pi-nopasswd
 #   sudo chmod 0440 /etc/sudoers.d/010_pi-nopasswd
 #   sudo visudo -c
 # ---------------------------------------------------------------------------
 
 param(
-    [string]$PiHost = "",
+    # Positional: one hostname or multiple. Accepts both equivalent forms:
+    #   .\deploy.ps1 kp1.local,kp2.local      # PS splits on commas -> string[]
+    #   .\deploy.ps1 "kp1.local,kp2.local"    # quoted single string
+    # Both work because the type is [string[]]; we re-join with commas
+    # before passing to Parse-Hosts so the quoted form is also split.
+    # Empty = use $PAGERS default. [string] (v1.0 dev iteration) broke on
+    # the unquoted form because PS binds `a,b` as an array and refused
+    # to coerce String[] -> String.
+    [Parameter(Position=0)][string[]]$PiHost = @(),
     [string]$PiUser = "pi",
     [switch]$All,
     [switch]$Setup,
@@ -53,6 +65,9 @@ param(
     [switch]$WipeHistory,
     [switch]$Tests,
     [switch]$Diag,
+    # Skip the automatic post-deploy diagnose.py run. Handy for rapid iteration
+    # where you only care that code was copied and the service restarted.
+    [switch]$NoTest,
     [switch]$Help
 )
 
@@ -73,7 +88,7 @@ if ($PSScriptRoot) {
 # ===========================================================================
 # Constants
 # ===========================================================================
-$PAGERS = @("kp2.local", "kp3.local")
+$PAGERS = @("kp1.local", "kp2.local")
 $KEY = "$env:USERPROFILE\.ssh\id_kidpager"
 
 # SSH options for already-authorized connections. Hostkey/known-hosts checks
@@ -118,19 +133,25 @@ KidPager Deploy
 
 Usage:
   .\deploy.ps1 -Help                          show this help
-  .\deploy.ps1 -Setup                         install SSH key on both pagers (no code push)
-  .\deploy.ps1 -All                           deploy to both pagers (auto-installs key)
-  .\deploy.ps1 -PiHost kp3.local         deploy to one pager
-  .\deploy.ps1 -Restart                       restart kidpager.service on both
-  .\deploy.ps1 -WipeHistory                   clear chat history on both
-  .\deploy.ps1 -All -WipeHistory              deploy then wipe
-  .\deploy.ps1 -All -Tests                    deploy + also copy test_*.py
-  .\deploy.ps1 -Diag                          run full diagnose.py on both
-  .\deploy.ps1 -Diag -PiHost kp3.local   diagnose one pager
+  .\deploy.ps1                                deploy + full test on both default pagers
+  .\deploy.ps1 kp2.local                      deploy + full test on one pager
+  .\deploy.ps1 kp1.local,kp2.local            deploy + full test on multiple pagers
+  .\deploy.ps1 -NoTest                        deploy without post-deploy diagnose.py run
+  .\deploy.ps1 -Setup                         install SSH key on targets (no code push)
+  .\deploy.ps1 -Restart                       restart kidpager.service on targets
+  .\deploy.ps1 -WipeHistory                   clear chat history on targets
+  .\deploy.ps1 -Tests                         deploy + also copy test_*.py
+  .\deploy.ps1 -Diag                          run full diagnose.py on targets
 
 Flags:
   -PiUser <name>   override SSH user (default: pi)
-  -Tests           include developer-only smoke tests in -All
+  -Tests           include developer-only smoke tests in the file copy step
+  -NoTest          skip the automatic diagnose.py run at the end of deploy
+  -All             back-compat alias: use the default pager list ($($PAGERS -join ', '))
+
+Targets:
+  Positional arg (first), -PiHost, or the `$PAGERS default list.
+  Positional and -PiHost both accept a comma-separated list.
 
 Key auth is automatic: on first contact the script installs ~\.ssh\id_kidpager.pub
 on the pager (asks for the pi password ONCE per device). Subsequent runs: zero prompts.
@@ -138,6 +159,18 @@ on the pager (asks for the pi password ONCE per device). Subsequent runs: zero p
 Passwordless sudo is required on the pager. The script detects a missing NOPASSWD
 and prints the fix command.
 "@
+}
+
+# Split a hostname string into a trimmed array. Accepts "a,b,c" or "a, b, c"
+# or just "a". Empty/whitespace tokens are dropped. Returns $null for an
+# empty input so callers can distinguish "no hosts given" from "".
+function Parse-Hosts {
+    param([string]$s)
+    if (-not $s) { return $null }
+    $list = $s -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    if ($list.Count -eq 0) { return $null }
+    # Force array even for single-element so `foreach` is uniform.
+    return @($list)
 }
 
 # Resolve an mDNS / LAN hostname to an IPv4 address.
@@ -321,13 +354,13 @@ function Ensure-Connectivity {
         Write-Host "  $HostName SSH key installed" -ForegroundColor Green
     }
 
-    # Catch stale mDNS/DNS that maps `kp3.local` to the IP of a
-    # DIFFERENT Pi (typically kp2) while the real target is offline.
-    # Without this check the deploy writes silently to the wrong pager
-    # and the [8/8] verify step still reports [OK] because prior deploys
-    # populated the fake-target with the same files. Only runs when the
-    # user passed a hostname (skipping for explicit IPs is intentional:
-    # if you asked for an IP, you know which device you're hitting).
+    # Catch stale mDNS/DNS that maps `<name>.local` to the IP of a
+    # DIFFERENT Pi while the real target is offline. Without this check
+    # the deploy writes silently to the wrong pager, and the [8/8] verify
+    # step still reports [OK] because prior deploys populated the
+    # fake-target with the same files. Only runs when the user passed a
+    # hostname (skipping for explicit IPs is intentional: if you asked
+    # for an IP, you know which device you're hitting).
     # Runs BEFORE the sudo check so a stale-DNS situation surfaces as a
     # HOSTNAME MISMATCH error rather than a misleading "sudo NOT configured"
     # (the latter would point the user at fixing the wrong device).
@@ -381,23 +414,37 @@ if (!(Test-Path $KEY)) {
 }
 
 # ===========================================================================
-# Action handlers (each Ensure-Connectivity's its own targets)
+# Target resolution — one source of truth for every action handler below.
+# Positional / -PiHost wins; otherwise fall back to $PAGERS. `-All` is kept
+# as an explicit back-compat alias for "default pager list" but is no longer
+# required — bare `.\deploy.ps1` now means the same thing.
+# ===========================================================================
+
+# Join array back into a comma-separated string so Parse-Hosts can normalise
+# both unquoted (PS pre-splits into array) and quoted (single string with
+# embedded commas) forms uniformly.
+$targets = Parse-Hosts ($PiHost -join ',')
+if (-not $targets) { $targets = $PAGERS }
+
+# ===========================================================================
+# Action handlers. Each one resolves connectivity per-host and is skippable
+# to keep `-Diag`, `-Restart`, etc. working standalone.
 # ===========================================================================
 
 if ($Setup) {
     Write-Host "=== SSH key setup ===" -ForegroundColor Cyan
     $ok = 0; $fail = 0
-    foreach ($dest in $PAGERS) {
+    foreach ($dest in $targets) {
         Write-Host "`n$dest"
         if (Ensure-Connectivity $dest) { $ok++ } else { $fail++ }
     }
     Write-Host "`n$ok ready, $fail failed" -ForegroundColor $(if ($fail -eq 0) { "Green" } else { "Yellow" })
-    if ($fail -eq 0) { Write-Host "Next: .\deploy.ps1 -All" -ForegroundColor Green }
+    if ($fail -eq 0) { Write-Host "Next: .\deploy.ps1 $($targets -join ',')" -ForegroundColor Green }
     exit $(if ($fail -eq 0) { 0 } else { 1 })
 }
 
 if ($Restart) {
-    foreach ($dest in $PAGERS) {
+    foreach ($dest in $targets) {
         $ip = Ensure-Connectivity $dest
         if (-not $ip) { continue }
         ssh @sshCmd "${PiUser}@${ip}" "sudo systemctl restart kidpager 2>/dev/null && echo $dest OK || echo $dest FAIL" 2>$null
@@ -406,9 +453,8 @@ if ($Restart) {
 }
 
 # Remote health check: runs diagnose.py on-device (-y auto-stops kidpager for
-# HW tests). Use -PiHost to target a single pager, otherwise runs on both.
+# HW tests). Standalone — no code push.
 if ($Diag) {
-    $targets = if ($PiHost) { @($PiHost) } else { $PAGERS }
     foreach ($dest in $targets) {
         $ip = Ensure-Connectivity $dest
         if (-not $ip) { continue }
@@ -418,9 +464,11 @@ if ($Diag) {
     exit 0
 }
 
-# Standalone wipe (no deploy)
-if ($WipeHistory -and -not $All -and -not $PiHost) {
-    foreach ($dest in $PAGERS) {
+# Standalone wipe (no deploy). Fires only when -WipeHistory is the sole
+# action: combined with deploy it runs at the end of the per-host loop
+# instead (see step [+] below).
+if ($WipeHistory -and -not $PiHost -and -not $All) {
+    foreach ($dest in $targets) {
         $ip = Ensure-Connectivity $dest
         if (-not $ip) { continue }
         Write-Host "Wipe history -> $dest" -ForegroundColor Magenta
@@ -430,15 +478,9 @@ if ($WipeHistory -and -not $All -and -not $PiHost) {
 }
 
 # ===========================================================================
-# Main deploy
+# Main deploy. Falls through to here when no action-only flag was given.
+# $targets is already resolved above.
 # ===========================================================================
-
-if ($All) { $targets = $PAGERS }
-elseif ($PiHost) { $targets = @($PiHost) }
-else {
-    Write-Host "Usage: -Help | -Setup | -All | -PiHost NAME | -Restart | -WipeHistory | -Diag [-PiHost NAME]"
-    exit 1
-}
 
 $start = Get-Date
 $results = [ordered]@{}
@@ -463,9 +505,10 @@ foreach ($dest in $targets) {
     #     "love" letter-merging bug). Try otb first, then xfonts-terminus.
     #     If both are unavailable, display_eink.py falls back to DejaVu at
     #     runtime so the pager still works, just with v0.13 rendering.
-    #   * avahi-daemon: mDNS publisher so kp3.local / kp2.local
-    #     resolve from Windows. Trixie Lite ships without it by default; a
-    #     first-deploy-by-IP is what bootstraps subsequent deploy-by-name.
+    #   * avahi-daemon: mDNS publisher so <host>.local (e.g. kp1.local,
+    #     kp2.local) resolves from Windows. Trixie Lite ships without it
+    #     by default; a first-deploy-by-IP is what bootstraps subsequent
+    #     deploy-by-name.
     #   * git + build-essential: needed to build pigpiod from source in [2/8]
     #     (not packaged on Raspberry Pi OS Trixie Lite).
     #
@@ -687,7 +730,27 @@ else:
     # Existing /root/.kidpager/config.json is NEVER overwritten (guarded by
     # `test -f`) -- preserves the user's name, channel, and silent flag
     # across redeploys.
-    ssh @sshCmd $t "sudo rm -f /home/pi/.kidpager/config.json; sudo mkdir -p /root/.kidpager; sudo test -f /root/.kidpager/config.json || echo '{""name"":""Kid"",""channel"":1,""silent"":false}' | sudo tee /root/.kidpager/config.json >/dev/null"
+    #
+    # Must use @'...'@ here-string to get valid JSON onto the pager.
+    # Earlier versions used `"... echo '{""name"":""Kid""}' ..."`, counting
+    # on PS-double-quote escape to produce literal `"` in the JSON. That
+    # works when the string is consumed by PowerShell, but PS 5.1 silently
+    # STRIPS nested `"` when it builds the Win32 argv for a native exe like
+    # ssh.exe -- the payload that reached bash was {name:Kid,channel:1,...}
+    # without any quotes, and Python's json.load choked with "Expecting
+    # property name enclosed in double quotes: line 1 column 2". Switching
+    # to a single-quoted PS here-string passes the bash heredoc through
+    # verbatim, and the bash-side <<'JSONEOF' (single-quoted delimiter)
+    # prevents any in-bash interpolation of the JSON body.
+    ssh @sshCmd $t @'
+sudo rm -f /home/pi/.kidpager/config.json
+sudo mkdir -p /root/.kidpager
+if ! sudo test -f /root/.kidpager/config.json; then
+    sudo tee /root/.kidpager/config.json >/dev/null <<'JSONEOF'
+{"name":"Kid","channel":1,"silent":false}
+JSONEOF
+fi
+'@
 
     Write-Host "  [6/8] kidpager.service" -ForegroundColor Cyan
     ssh @sshCmd $t "sudo bash -c 'cat > /etc/systemd/system/kidpager.service << SVCEOF
@@ -722,7 +785,8 @@ systemctl daemon-reload && systemctl enable kidpager && echo OK'"
     ssh @sshCmd $t "sudo bash -c 'cat > /etc/systemd/system/kidpager-power.service << PWREOF
 [Unit]
 Description=KidPager power-saving (rfkill wifi, powersave governor, LED off)
-After=multi-user.target
+After=multi-user.target NetworkManager.service
+Wants=NetworkManager.service
 Before=kidpager.service
 [Service]
 Type=oneshot
@@ -769,17 +833,50 @@ echo '---'
 }
 
 # ===========================================================================
+# Post-deploy full functionality test (unless -NoTest).
+# Runs diagnose.py on every host that deployed cleanly. Same script the
+# standalone -Diag flag uses; -y auto-stops the service so HW (SPI, E-Ink,
+# buzzer) can be exercised without prompting.
+# ===========================================================================
+
+if (-not $NoTest) {
+    foreach ($dest in $targets) {
+        if ($results[$dest] -ne "OK") { continue }
+        Write-Host "`n=== Test $dest ===" -ForegroundColor Yellow
+        # Resolve once more -- the IP could in theory have shifted if DHCP
+        # renewed during the deploy, and we also want the connectivity
+        # probe to catch a post-deploy regression (e.g. kidpager.service
+        # wedged SPI on startup).
+        $ip = Ensure-Connectivity $dest
+        if (-not $ip) {
+            $results[$dest] = "deployed-but-unreachable"
+            continue
+        }
+        ssh @sshCmd "${PiUser}@${ip}" "cd /home/pi/kidpager && sudo python3 diagnose.py -y" 2>$null
+        # diagnose.py exits 1 on any FAIL, 0 on pass-with-possibly-warnings.
+        # Surface that in the summary so the operator sees a red line for
+        # the host if the test didn't pass cleanly.
+        if ($LASTEXITCODE -ne 0) {
+            $results[$dest] = "deployed-test-FAIL"
+        } else {
+            $results[$dest] = "deployed+tested"
+        }
+    }
+}
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 
 $elapsed = (Get-Date) - $start
-$okCount = ($results.Values | Where-Object { $_ -eq "OK" }).Count
+$goodStates = @("OK", "deployed+tested")
+$okCount = ($results.Values | Where-Object { $goodStates -contains $_ }).Count
 $totalCount = $results.Count
 
 Write-Host ""
 Write-Host "=== Summary ($([int]$elapsed.TotalSeconds)s) ===" -ForegroundColor Cyan
 foreach ($kv in $results.GetEnumerator()) {
-    $color = if ($kv.Value -eq "OK") { "Green" } else { "Red" }
+    $color = if ($goodStates -contains $kv.Value) { "Green" } else { "Red" }
     Write-Host ("  {0,-24} {1}" -f $kv.Key, $kv.Value) -ForegroundColor $color
 }
 Write-Host "$okCount/$totalCount successful" -ForegroundColor $(if ($okCount -eq $totalCount) { "Green" } else { "Yellow" })
@@ -787,10 +884,16 @@ Write-Host "$okCount/$totalCount successful" -ForegroundColor $(if ($okCount -eq
 if ($okCount -gt 0) {
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor Yellow
-    Write-Host "  1. Pair the M4 on each pager:  ssh pi@kp3.local -> sudo ~/bt_pair.sh" -ForegroundColor Yellow
-    Write-Host "  2. Reboot each pager once (power-save activates on boot)" -ForegroundColor Yellow
-    Write-Host "  3. Verify:  .\deploy.ps1 -Diag" -ForegroundColor Yellow
-    Write-Host "  (After reboot Wi-Fi is blocked. Alt+W on the M4 re-enables it for re-deploys.)" -ForegroundColor DarkGray
+    Write-Host "  1. Pair the M4 on each pager:  ssh pi@<host> -> sudo ~/bt_pair.sh" -ForegroundColor Yellow
+    Write-Host "  2. Reboot each pager once to activate power-save" -ForegroundColor Yellow
+    Write-Host "     - cold reboot (power / systemctl) boots straight into field mode (Wi-Fi blocked)" -ForegroundColor DarkGray
+    Write-Host "     - UI reboot (profile -> Reboot device) opens a 10-min deploy window first, then auto-blocks" -ForegroundColor DarkGray
+    if ($NoTest) {
+        Write-Host "  3. Verify:  .\deploy.ps1 -Diag $($targets -join ',')" -ForegroundColor Yellow
+    } else {
+        Write-Host "  3. Verified above -- diagnose.py passed." -ForegroundColor Yellow
+    }
+    Write-Host "  (Field mode = Wi-Fi off. Alt+W on the M4 or the UI reboot both re-enable it for re-deploys.)" -ForegroundColor DarkGray
 }
 
 exit $(if ($okCount -eq $totalCount) { 0 } else { 1 })
