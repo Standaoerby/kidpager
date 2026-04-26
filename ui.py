@@ -114,12 +114,22 @@ class PagerUI:
         self.eink = None
         self.wifi_on = False
         self._dirty = False
-        # When True, the next chat refresh will force a full E-Ink
-        # redraw (init + display) instead of partial. Set by wake paths
-        # (keyboard or incoming message) so the "Zzz" + name sleep
-        # screen doesn't ghost behind the chat view. Consumed (and
-        # cleared) by eink_refresh on the next draw_chat call.
+        # When True, the next E-Ink refresh will force a full panel
+        # refresh (single displayPartBaseImage cycle) instead of
+        # partial. Set by:
+        #   * sleep wake paths (keyboard or incoming message) so the
+        #     "Zzz" sleep screen doesn't ghost under chat
+        #   * add_message() so message send / receive present a
+        #     visually clean frame
+        # Consumed (and cleared) by eink_refresh on the next draw call,
+        # regardless of which state is active.
         self._force_next_full = False
+        # Last state we successfully rendered. eink_refresh() compares
+        # to self.state and forces a full refresh on transition --
+        # going chat<->profile<->name_edit<->channel_edit changes the
+        # whole layout, so partial refresh leaves visible artifacts of
+        # the previous screen.
+        self._last_rendered_state = None
         self._load_history()
         if HAS_EINK:
             try:
@@ -329,6 +339,13 @@ class PagerUI:
             self.messages = self.messages[-MAX_HISTORY:]
         self._dirty = True
         self.scroll = 0
+        # Force a clean full refresh for both message send and receive.
+        # These are the high-value visual updates: the input line just
+        # cleared (send) or a new line just landed (receive). Partial
+        # refresh would leave a ghost of the previous input or chat
+        # state under the new content. Single full refresh = ~3
+        # flashes, totally acceptable for a once-per-message event.
+        self._force_next_full = True
         return True
 
     def mark_delivered(self, msg_id):
@@ -368,6 +385,18 @@ class PagerUI:
     def eink_refresh(self):
         if not self.eink:
             return
+        # Force a full refresh on state transitions. chat<->profile and
+        # name_edit/channel_edit have very different layouts, so partial
+        # refresh leaves ghost rectangles from the previous menu's
+        # selected-row highlight or the previous chat's input line.
+        state_changed = self._last_rendered_state != self.state
+        self._last_rendered_state = self.state
+        # Consume the one-shot force-full flag (set by add_message,
+        # wake paths, etc.). Combine with state-change so a single
+        # eink_refresh call does the right thing whichever path
+        # triggered it.
+        force = self._force_next_full or state_changed
+        self._force_next_full = False
         try:
             if self.state == "chat":
                 cutoff = len(self.messages) - self.scroll
@@ -375,21 +404,22 @@ class PagerUI:
                 if cutoff <= 0:
                     cutoff = 1; start = 0
                 visible = self.messages[start:cutoff]
-                # Consume the one-shot force-full flag (set on wake).
-                force = self._force_next_full
-                self._force_next_full = False
                 self.eink.draw_chat(self.config.name, self.config.channel,
                                     visible, self.input_buf,
                                     self.lora is not None, self.wifi_on,
                                     self.config.silent, force_full=force)
             elif self.state == "profile":
                 self.eink.draw_profile(self.config.name, self.config.channel,
-                                       self.config.silent, self.profile_sel)
+                                       self.config.silent, self.profile_sel,
+                                       force_full=force)
             elif self.state == "name_edit":
-                self.eink.draw_name_edit(self.config.name)
+                self.eink.draw_name_edit(self.config.name, force_full=force)
             elif self.state == "channel_edit":
-                self.eink.draw_channel_edit(self.config.channel)
+                self.eink.draw_channel_edit(self.config.channel, force_full=force)
             elif self.state == "reboot_confirm":
+                # draw_reboot_confirm/rebooting/sleep already submit
+                # with force_full=True internally; the `force` flag
+                # would only redundantly turn it on again.
                 self.eink.draw_reboot_confirm(self.config.name)
             elif self.state == "rebooting":
                 self.eink.draw_rebooting(self.config.name)

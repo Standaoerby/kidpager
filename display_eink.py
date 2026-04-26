@@ -33,6 +33,21 @@ from pins import EINK_RST, EINK_BUSY
 WIDTH = 250
 HEIGHT = 122
 
+# Periodic full refresh. The V4 panel accumulates LUT error under
+# sustained partial refreshes; an occasional full + base-image seed
+# resets it. With explicit force_full triggers on send / receive /
+# state-transition (see ui.py), periodic-full is mostly a safety net
+# for "user types 20 chars without hitting any other trigger" -- 20 is
+# conservative enough to rarely matter in practice but still catches
+# pathological cases.
+#
+# History: v1.0 tried 7 here to fight ghosting, combined with a double
+# full refresh (display + displayPartBaseImage) that produced ~6
+# visible flashes per cycle. Moving to a single displayPartBaseImage
+# (which does both in one panel turn-on) plus more explicit force_full
+# events lets us relax this back to 20 without the ghost coming back.
+FULL_REFRESH_EVERY = 20
+
 # Layout
 HEADER_H = 15
 MSG_TOP = 17
@@ -244,7 +259,13 @@ def _hw_reset():
     return False
 
 
-_hw_reset()
+# NOTE: _hw_reset() is NOT called here at import time. Importing this
+# module used to poke EINK_RST/EINK_BUSY which is a side effect that
+# breaks in two ways: (a) `import display_eink` from a diagnostic tool
+# without a live panel raises GPIO warnings / leaves the pin configured
+# for the rest of the process; (b) it happens before __init__ wants to,
+# so if the caller never instantiates EInkDisplay we've still touched
+# the hardware. Moved into EInkDisplay.__init__ below.
 from waveshare_epd import epd2in13_V4 as epd_driver
 
 
@@ -261,11 +282,24 @@ def _draw_header(d, name, lora_on=False, wifi_on=False, silent=False):
 
 class EInkDisplay:
     def __init__(self):
+        # Hardware reset first. Clears a stuck BUSY from a prior run /
+        # crash / unclean systemd shutdown -- otherwise epd.init() hangs
+        # waiting for the panel to ack. Moved here from module load so
+        # `import display_eink` is side-effect-free (matters for tests
+        # and introspection tools that don't need a live panel).
+        _hw_reset()
         self.epd = epd_driver.EPD()
         self.epd.init()
         self.epd.Clear(0xFF)
         self.first_draw = True
         self.updates = 0
+        # True while the panel is in controller-sleep (epd.sleep()) and
+        # the next submitted frame must be preceded by epd.init() + full
+        # refresh. Currently only set by the public sleep() method (the
+        # shutdown path); _render() clears it when it wakes the panel.
+        # Kept as a guard so a stray submission AFTER cleanup() but
+        # BEFORE the process exits doesn't try to draw on a slept panel.
+        self._asleep = False
         self._pending = None
         self._pending_force_full = False
         self._lock = threading.Lock()
@@ -283,7 +317,7 @@ class EInkDisplay:
             font_label = os.path.basename(fp)
         else:
             font_label = "<pillow bundled default>"
-        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker) font={font_label}")
+        print(f"E-Ink: {WIDTH}x{HEIGHT}, V4 (bg worker, full/{FULL_REFRESH_EVERY}) font={font_label}")
 
     def draw_chat(self, name, channel, messages, input_text,
                   lora_on=False, wifi_on=False, silent=False,
@@ -337,7 +371,7 @@ class EInkDisplay:
 
         self._submit(img, force_full=force_full)
 
-    def draw_profile(self, name, channel, silent, selection):
+    def draw_profile(self, name, channel, silent, selection, force_full=False):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, WIDTH, HEADER_H - 1], fill=0)
@@ -358,9 +392,9 @@ class EInkDisplay:
             else:
                 d.text((10, y), item, font=FONT, fill=0)
             y += row_h
-        self._submit(img)
+        self._submit(img, force_full=force_full)
 
-    def draw_name_edit(self, name):
+    def draw_name_edit(self, name, force_full=False):
         """Name editor. Same cursor treatment as the chat input line --
         draw the buffer, then an underscore immediately after."""
         img = Image.new("1", (WIDTH, HEIGHT), 255)
@@ -376,9 +410,9 @@ class EInkDisplay:
         if cursor_x > max_x:
             cursor_x = max_x
         d.text((cursor_x, 62), CURSOR, font=FONT, fill=0)
-        self._submit(img)
+        self._submit(img, force_full=force_full)
 
-    def draw_channel_edit(self, channel):
+    def draw_channel_edit(self, channel, force_full=False):
         img = Image.new("1", (WIDTH, HEIGHT), 255)
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, WIDTH, HEADER_H - 1], fill=0)
@@ -388,7 +422,7 @@ class EInkDisplay:
         d.text((18, 54), f"<   {channel}   >", font=FONT_BD, fill=0)
         d.text((10, 82), "UP/DOWN or L/R: change", font=FONT_SM, fill=0)
         d.text((10, 96), "ENTER: save", font=FONT_SM, fill=0)
-        self._submit(img)
+        self._submit(img, force_full=force_full)
 
     def draw_reboot_confirm(self, name):
         """Numeric-choice confirmation before issuing a reboot from the
@@ -455,17 +489,21 @@ class EInkDisplay:
         self._wake.set()
 
     def _worker(self):
+        """Background render loop.
+
+        Simple wait-drain pattern:
+          * wait() blocks on self._wake (no timeout -- we don't need
+            controller-level idle sleep, V4 auto-enters self-refresh
+            after TurnOnDisplay and draws near-zero between frames).
+          * on wake, drain ALL pending frames. Drain is UNCONDITIONAL
+            (not gated on self._stop) so the last frame submitted
+            before shutdown -- typically the "Rebooting..." screen --
+            always reaches the panel even if cleanup() set _stop
+            between wait() and here.
+        """
         while not self._stop:
             self._wake.wait()
             self._wake.clear()
-            # Drain pending UNCONDITIONALLY — not `while not self._stop`. If
-            # cleanup() sets _stop between the outer `wait()` and the
-            # inner check, the last submitted frame (typically the
-            # "Rebooting..." screen queued right before teardown) would
-            # otherwise be discarded without a render, leaving the
-            # prior menu frame on the panel until the kernel cuts power.
-            # Drain first, check stop second: guarantees the final frame
-            # always reaches the E-Ink even during a clean shutdown.
             while True:
                 with self._lock:
                     img = self._pending
@@ -481,33 +519,106 @@ class EInkDisplay:
                     print(f"E-Ink worker error: {e}")
 
     def _render(self, img, force_full=False):
+        """Render one image. Called under _hw_lock.
+
+        Full-refresh triggers:
+          * first_draw        -- very first frame after boot.
+          * was_asleep        -- woken from public sleep() call (shutdown
+                                 path or future low-power mode). Partial
+                                 refresh on a just-woken panel is
+                                 guaranteed broken, so we force full.
+          * force_full        -- caller asked for one. Set by ui.py on:
+                                 message send, message receive, state
+                                 transitions, and the always-full screens
+                                 (reboot_confirm, rebooting, sleep).
+          * updates >= N-1    -- periodic LUT reset every
+                                 FULL_REFRESH_EVERY partials as a
+                                 safety net against ghost accumulation
+                                 in cases with no other trigger (e.g.
+                                 user typing a very long message
+                                 without sending).
+
+        Full-refresh implementation:
+          We use displayPartBaseImage() when available (V4 driver does
+          one full panel turn-on that writes to BOTH the current RAM
+          bank (0x24) AND the previous-frame bank (0x26) used as the
+          reference for subsequent partials). That's the same visual
+          cost as display() -- a single TurnOnDisplay -- but seeds the
+          base image as a side effect, which is what stops ghost
+          accumulation.
+
+          Previous version called display() + displayPartBaseImage()
+          which produced TWO panel turn-ons per full = ~6 visible
+          flashes and that's exactly what users complained about.
+          Single call = ~3 flashes, same cleanliness.
+        """
+        was_asleep = self._asleep
+        if was_asleep:
+            # Panel was in controller-sleep; re-init wakes it and
+            # reloads the full-refresh LUT.
+            self.epd.init()
+            self._asleep = False
+
         buf = self.epd.getbuffer(img)
-        if self.first_draw:
-            self.epd.display(buf)
+
+        needs_full = (
+            self.first_draw
+            or force_full
+            or was_asleep
+            or (self.updates + 1) >= FULL_REFRESH_EVERY
+        )
+
+        if needs_full:
+            # For a periodic full (not on wake, not first), re-init
+            # before the refresh to reset the LUT state. Wake path
+            # already inited above; first_draw path inited in __init__.
+            if not was_asleep and not self.first_draw:
+                self.epd.init()
+            self._full_refresh(buf)
             self.first_draw = False
             self.updates = 0
             return
-        if force_full:
-            self.epd.init()
-            self.epd.display(buf)
-            self.updates = 0
-            return
+
         self.updates += 1
-        if self.updates >= 20:
-            self.epd.init()
+        self.epd.displayPartial(buf)
+
+    def _full_refresh(self, buf):
+        """One full refresh that also seeds the partial-refresh base.
+        V4: displayPartBaseImage is a single panel turn-on that writes
+        to both RAM banks -- strictly better than calling display()
+        then displayPartBaseImage() separately (which costs two panel
+        cycles and produces ~6 visible flashes per "full")."""
+        setter = getattr(self.epd, "displayPartBaseImage", None)
+        if setter is not None:
+            try:
+                setter(buf)
+                return
+            except Exception as e:
+                print(f"E-Ink displayPartBaseImage error: {e}; "
+                      f"falling back to display()")
+        # Non-V4 driver or displayPartBaseImage broke. Plain full
+        # refresh still works; partials will ghost more than V4 with
+        # proper base seeding but the visible content is correct.
+        try:
             self.epd.display(buf)
-            self.updates = 0
-        else:
-            self.epd.displayPartial(buf)
+        except Exception as e:
+            print(f"E-Ink display fallback error: {e}")
 
     def clear(self):
         with self._lock:
             self._pending = None
             self._pending_force_full = False
         with self._hw_lock:
+            if self._asleep:
+                # Wake the panel before issuing display ops, otherwise
+                # Clear() sends commands to a dead controller and hangs
+                # on BUSY waiting for an ack that never comes.
+                self.epd.init()
+                self._asleep = False
             self.epd.init()
             self.epd.Clear(0xFF)
             self.first_draw = True
+            self.updates = 0
 
     def cleanup(self):
         self._stop = True
@@ -516,5 +627,14 @@ class EInkDisplay:
             self._thread.join(timeout=3)
 
     def sleep(self):
+        """Public sleep for the shutdown path. Idempotent against the
+        worker's own idle-sleep so main.py can always call it in
+        `finally:` without worrying whether the worker beat us to it."""
         with self._hw_lock:
-            self.epd.sleep()
+            if self._asleep:
+                return
+            try:
+                self.epd.sleep()
+                self._asleep = True
+            except Exception as e:
+                print(f"E-Ink sleep error: {e}")

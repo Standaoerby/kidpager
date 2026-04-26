@@ -255,12 +255,25 @@ class LoRaRadio:
     def cleanup(self):
         if self.spi:
             try:
+                # Drop the chip to STDBY_RC before releasing SPI. Skips
+                # OP_SET_SLEEP because waking from the deeper sleep
+                # requires a GPIO reset pulse and we may be mid-shutdown;
+                # STDBY_RC is ~1 mA and safe to leave in any state.
                 self._cmd(OP_SET_STANDBY, [STDBY_RC])
                 self.spi.close()
             except Exception:
                 pass
+        # SCOPED cleanup: only the pins we configured in init(). Passing
+        # no arg to GPIO.cleanup() would also reset the E-Ink pins
+        # (EINK_RST, EINK_BUSY, EINK_DC) configured by display_eink.py,
+        # which in main.py's shutdown sequence runs BEFORE the e-ink's
+        # own cleanup -- blanking EINK_RST mid-shutdown used to cause
+        # the panel to latch into an undefined state, leaving a partial
+        # "Rebooting..." frame or streaked artifacts until the next
+        # boot. Listing only LoRa pins here makes teardown order
+        # insensitive.
         try:
-            GPIO.cleanup()
+            GPIO.cleanup([LORA_RST, LORA_DIO1, LORA_BUSY])
         except Exception:
             pass
 
